@@ -21,7 +21,7 @@ TODAY = date.today()
 
 # --- Sidebar navigation ---
 st.sidebar.title("Navigation")
-page = st.sidebar.radio("Go to", ["Dashboard", "Check In / Out", "Usage Logging", "Alerts & Reminders", "Demand Forecasting", "Anomaly Detection"], label_visibility="collapsed")
+page = st.sidebar.radio("Go to", ["Dashboard", "Check In / Out", "Usage Logging", "Alerts & Reminders", "Demand Forecasting", "Anomaly Detection", "Smart Scheduling"], label_visibility="collapsed")
 
 
 # === Shared helpers ===
@@ -1226,3 +1226,302 @@ elif page == "Anomaly Detection":
                 f"</div></div>",
                 unsafe_allow_html=True,
             )
+
+
+# =====================================================================
+# PAGE 7: SMART SCHEDULING
+# =====================================================================
+elif page == "Smart Scheduling":
+    st.markdown(
+        "<h1 style='text-align:center;'>Smart Scheduling</h1>",
+        unsafe_allow_html=True,
+    )
+    st.caption("AI-recommended operator-equipment assignments based on historical performance and site experience")
+
+    import os
+    SYNTH_DB = "equipment_rental_synthetic.db"
+    MAIN_DB = "equipment_rental.db"
+    sched_db = SYNTH_DB if os.path.exists(SYNTH_DB) else MAIN_DB
+    conn = sqlite3.connect(sched_db)
+
+    history_df = pd.read_sql_query("""
+        SELECT r.operator_id, r.site_id, r.equipment_id, e.type AS equipment_type,
+               r.rental_days, r.is_returned,
+               r.engine_hours_per_day, r.idle_hours_per_day,
+               r.check_in_date, r.actual_return_date, r.expected_return_date
+        FROM rentals r
+        JOIN equipment e ON r.equipment_id = e.equipment_id
+        WHERE r.operator_id IS NOT NULL
+          AND r.check_in_date IS NOT NULL AND r.check_in_date != '1900-01-01'
+        ORDER BY r.check_in_date
+    """, conn)
+
+    available_eq = pd.read_sql_query(
+        "SELECT equipment_id, type, status FROM equipment WHERE status = 'available' ORDER BY equipment_id", conn
+    )
+    busy_operators = pd.read_sql_query(
+        "SELECT DISTINCT operator_id FROM rentals WHERE is_returned = 0 AND operator_id IS NOT NULL", conn
+    )
+    conn.close()
+
+    if history_df.empty:
+        st.warning("No rental history available for scheduling recommendations.")
+    else:
+        history_df["check_in_date"] = pd.to_datetime(history_df["check_in_date"])
+        history_df["actual_return_date"] = pd.to_datetime(history_df["actual_return_date"])
+        history_df["expected_return_date"] = pd.to_datetime(history_df["expected_return_date"])
+
+        completed = history_df[history_df["is_returned"] == 1].copy()
+        completed["utilization"] = completed["engine_hours_per_day"] / (
+            completed["engine_hours_per_day"] + completed["idle_hours_per_day"]
+        ).replace(0, float("nan"))
+
+        completed["was_on_time"] = (
+            completed["actual_return_date"] <= completed["expected_return_date"]
+        ).astype(int)
+
+        busy_set = set(busy_operators["operator_id"].tolist()) if not busy_operators.empty else set()
+        all_operators = sorted(history_df["operator_id"].unique().tolist())
+        free_operators = [op for op in all_operators if op not in busy_set]
+
+        # --- Operator experience by site ---
+        site_exp = completed.groupby(["operator_id", "site_id"]).agg(
+            rentals=("equipment_id", "count"),
+            total_days=("rental_days", "sum"),
+            avg_utilization=("utilization", "mean"),
+            on_time_pct=("was_on_time", "mean"),
+        ).reset_index()
+        site_exp["avg_utilization"] = (site_exp["avg_utilization"] * 100).round(1)
+        site_exp["on_time_pct"] = (site_exp["on_time_pct"] * 100).round(1)
+
+        # --- Operator experience by equipment type ---
+        type_exp = completed.groupby(["operator_id", "equipment_type"]).agg(
+            rentals=("equipment_id", "count"),
+            total_days=("rental_days", "sum"),
+            avg_utilization=("utilization", "mean"),
+            on_time_pct=("was_on_time", "mean"),
+        ).reset_index()
+        type_exp["avg_utilization"] = (type_exp["avg_utilization"] * 100).round(1)
+        type_exp["on_time_pct"] = (type_exp["on_time_pct"] * 100).round(1)
+
+        # --- Combined experience (site + type) ---
+        combo_exp = completed.groupby(["operator_id", "site_id", "equipment_type"]).agg(
+            rentals=("equipment_id", "count"),
+            total_days=("rental_days", "sum"),
+            avg_utilization=("utilization", "mean"),
+            on_time_pct=("was_on_time", "mean"),
+        ).reset_index()
+        combo_exp["avg_utilization"] = (combo_exp["avg_utilization"] * 100).round(1)
+        combo_exp["on_time_pct"] = (combo_exp["on_time_pct"] * 100).round(1)
+
+        # --- Scoring function ---
+        def compute_score(row):
+            rental_score = min(row["rentals"] / 5, 1.0) * 30
+            days_score = min(row["total_days"] / 100, 1.0) * 20
+            util_score = (row["avg_utilization"] / 100) * 25
+            ontime_score = (row["on_time_pct"] / 100) * 25
+            return round(rental_score + days_score + util_score + ontime_score, 1)
+
+        # =============================================================
+        # SECTION 1: AI RECOMMENDATION ENGINE
+        # =============================================================
+        st.subheader("Get AI Recommendation")
+
+        rec1, rec2 = st.columns(2)
+        with rec1:
+            all_sites = sorted(history_df["site_id"].dropna().unique().tolist())
+            target_site = st.selectbox("Select Target Site", all_sites, key="sched_site")
+        with rec2:
+            all_types = sorted(history_df["equipment_type"].dropna().unique().tolist())
+            target_type = st.selectbox("Select Equipment Type", all_types, key="sched_type")
+
+        only_free = st.checkbox("Show only available operators", value=True)
+
+        candidates = combo_exp[
+            (combo_exp["site_id"] == target_site) & (combo_exp["equipment_type"] == target_type)
+        ].copy()
+
+        site_only = site_exp[site_exp["site_id"] == target_site].copy()
+        type_only = type_exp[type_exp["equipment_type"] == target_type].copy()
+
+        all_scored = []
+
+        scored_operators = set()
+        for _, row in candidates.iterrows():
+            scored_operators.add(row["operator_id"])
+            all_scored.append({
+                "operator_id": row["operator_id"],
+                "match_type": "Exact (Site + Type)",
+                "rentals": row["rentals"],
+                "total_days": row["total_days"],
+                "avg_utilization": row["avg_utilization"],
+                "on_time_pct": row["on_time_pct"],
+                "score": compute_score(row),
+            })
+
+        for _, row in site_only.iterrows():
+            if row["operator_id"] not in scored_operators:
+                scored_operators.add(row["operator_id"])
+                all_scored.append({
+                    "operator_id": row["operator_id"],
+                    "match_type": "Site Experience",
+                    "rentals": row["rentals"],
+                    "total_days": row["total_days"],
+                    "avg_utilization": row["avg_utilization"],
+                    "on_time_pct": row["on_time_pct"],
+                    "score": compute_score(row) * 0.7,
+                })
+
+        for _, row in type_only.iterrows():
+            if row["operator_id"] not in scored_operators:
+                scored_operators.add(row["operator_id"])
+                all_scored.append({
+                    "operator_id": row["operator_id"],
+                    "match_type": "Type Experience",
+                    "rentals": row["rentals"],
+                    "total_days": row["total_days"],
+                    "avg_utilization": row["avg_utilization"],
+                    "on_time_pct": row["on_time_pct"],
+                    "score": compute_score(row) * 0.6,
+                })
+
+        if all_scored:
+            scored_df = pd.DataFrame(all_scored).sort_values("score", ascending=False)
+            if only_free:
+                scored_df = scored_df[~scored_df["operator_id"].isin(busy_set)]
+
+            if scored_df.empty:
+                st.warning("No available operators found with experience for this combination.")
+            else:
+                top = scored_df.iloc[0]
+                st.markdown(
+                    f"<div style='background:#22c55e15; border-left:5px solid #22c55e; "
+                    f"padding:16px 20px; border-radius:8px; margin-bottom:16px;'>"
+                    f"<div style='font-size:13px; color:#22c55e; font-weight:600; text-transform:uppercase;'>"
+                    f"AI Recommended Operator</div>"
+                    f"<div style='font-size:24px; font-weight:700; margin-top:4px;'>{top['operator_id']}</div>"
+                    f"<div style='margin-top:8px; font-size:14px; color:#374151;'>"
+                    f"<b>Match:</b> {top['match_type']} &nbsp;|&nbsp; "
+                    f"<b>Score:</b> {top['score']:.1f}/100 &nbsp;|&nbsp; "
+                    f"<b>Rentals:</b> {int(top['rentals'])} &nbsp;|&nbsp; "
+                    f"<b>Total Days:</b> {int(top['total_days'])} &nbsp;|&nbsp; "
+                    f"<b>Utilization:</b> {top['avg_utilization']:.1f}% &nbsp;|&nbsp; "
+                    f"<b>On-Time:</b> {top['on_time_pct']:.1f}%</div>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+
+                st.markdown("#### All Candidates (Ranked)")
+                display_scored = scored_df.copy()
+                display_scored["score"] = display_scored["score"].round(1)
+                display_scored["is_free"] = ~display_scored["operator_id"].isin(busy_set)
+                display_scored["is_free"] = display_scored["is_free"].map({True: "Available", False: "Busy"})
+                display_scored.columns = [
+                    "Operator", "Match Type", "Rentals", "Total Days",
+                    "Utilization %", "On-Time %", "Score", "Status"
+                ]
+                st.dataframe(display_scored, use_container_width=True, hide_index=True)
+        else:
+            st.info(f"No operator has prior experience at **{target_site}** with **{target_type}**. Any available operator can be assigned.")
+            if free_operators:
+                st.markdown(f"**Available operators:** {', '.join(free_operators[:10])}")
+
+        # =============================================================
+        # SECTION 2: OPERATOR EXPERIENCE — BY SITE
+        # =============================================================
+        st.markdown("---")
+        st.subheader("Operator Experience — By Site")
+        st.caption("Operators ranked by total rental days at each site")
+
+        site_filter = st.selectbox("Filter by Site", ["All"] + all_sites, key="exp_site")
+        site_display = site_exp.copy()
+        if site_filter != "All":
+            site_display = site_display[site_display["site_id"] == site_filter]
+
+        site_display["score"] = site_display.apply(compute_score, axis=1)
+        site_display = site_display.sort_values("score", ascending=False)
+        site_display.columns = ["Operator", "Site", "Rentals", "Total Days", "Utilization %", "On-Time %", "Score"]
+        st.dataframe(site_display, use_container_width=True, hide_index=True)
+
+        # =============================================================
+        # SECTION 3: OPERATOR EXPERIENCE — BY EQUIPMENT TYPE
+        # =============================================================
+        st.markdown("---")
+        st.subheader("Operator Experience — By Equipment Type")
+        st.caption("Operators ranked by total rental days with each equipment type")
+
+        type_filter = st.selectbox("Filter by Type", ["All"] + all_types, key="exp_type")
+        type_display = type_exp.copy()
+        if type_filter != "All":
+            type_display = type_display[type_display["equipment_type"] == type_filter]
+
+        type_display["score"] = type_display.apply(compute_score, axis=1)
+        type_display = type_display.sort_values("score", ascending=False)
+        type_display.columns = ["Operator", "Equipment Type", "Rentals", "Total Days", "Utilization %", "On-Time %", "Score"]
+        st.dataframe(type_display, use_container_width=True, hide_index=True)
+
+        # =============================================================
+        # SECTION 4: TOP OPERATORS OVERVIEW
+        # =============================================================
+        st.markdown("---")
+        st.subheader("Top Operators — Overall Performance")
+
+        overall = completed.groupby("operator_id").agg(
+            total_rentals=("equipment_id", "count"),
+            total_days=("rental_days", "sum"),
+            unique_sites=("site_id", "nunique"),
+            unique_types=("equipment_type", "nunique"),
+            avg_utilization=("utilization", "mean"),
+            on_time_pct=("was_on_time", "mean"),
+        ).reset_index()
+        overall["avg_utilization"] = (overall["avg_utilization"] * 100).round(1)
+        overall["on_time_pct"] = (overall["on_time_pct"] * 100).round(1)
+        overall["is_free"] = ~overall["operator_id"].isin(busy_set)
+        overall["is_free"] = overall["is_free"].map({True: "Available", False: "Busy"})
+        overall = overall.sort_values("total_rentals", ascending=False)
+        overall.columns = [
+            "Operator", "Total Rentals", "Total Days", "Sites Worked",
+            "Types Operated", "Utilization %", "On-Time %", "Status"
+        ]
+
+        top_cards = overall.head(5)
+        cols = st.columns(5)
+        for col, (_, row) in zip(cols, top_cards.iterrows()):
+            clr = "#22c55e" if row["Status"] == "Available" else "#6b7280"
+            col.markdown(
+                f"<div style='background:{clr}15; border-left:4px solid {clr}; padding:12px 14px; border-radius:8px; text-align:center;'>"
+                f"<div style='font-size:20px; font-weight:700; color:{clr};'>{row['Operator']}</div>"
+                f"<div style='font-size:12px; color:#6b7280; margin-top:4px;'>"
+                f"{int(row['Total Rentals'])} rentals &nbsp;|&nbsp; {int(row['Total Days'])} days<br>"
+                f"{int(row['Sites Worked'])} sites &nbsp;|&nbsp; {int(row['Types Operated'])} types<br>"
+                f"Util: {row['Utilization %']}% &nbsp;|&nbsp; On-Time: {row['On-Time %']}%"
+                f"</div>"
+                f"<div style='margin-top:6px;'>"
+                f"<span style='background:{clr}25; color:{clr}; padding:2px 8px; border-radius:8px; font-size:11px; font-weight:600;'>"
+                f"{row['Status']}</span></div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("")
+        st.dataframe(overall, use_container_width=True, hide_index=True)
+
+        # =============================================================
+        # SECTION 5: EXPERIENCE HEATMAP — SITE vs TYPE
+        # =============================================================
+        st.markdown("---")
+        st.subheader("Operator Experience Heatmap")
+        st.caption("Number of completed rentals per operator across sites and equipment types")
+
+        heatmap_view = st.radio("View by", ["Site", "Equipment Type"], horizontal=True, key="heatmap_view")
+
+        if heatmap_view == "Site":
+            pivot = completed.groupby(["operator_id", "site_id"])["equipment_id"].count().reset_index()
+            pivot.columns = ["Operator", "Site", "Rentals"]
+            pivot_table = pivot.pivot(index="Operator", columns="Site", values="Rentals").fillna(0).astype(int)
+        else:
+            pivot = completed.groupby(["operator_id", "equipment_type"])["equipment_id"].count().reset_index()
+            pivot.columns = ["Operator", "Type", "Rentals"]
+            pivot_table = pivot.pivot(index="Operator", columns="Type", values="Rentals").fillna(0).astype(int)
+
+        st.dataframe(pivot_table.style.background_gradient(cmap="YlGn", axis=None), use_container_width=True)
