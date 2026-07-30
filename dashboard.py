@@ -517,6 +517,40 @@ elif page == "Usage Logging":
         else:
             st.info("No completed rentals for downtime analysis.")
 
+        st.markdown("---")
+
+        # --- Fuel Consumption ---
+        st.subheader("Fuel Consumption per Equipment")
+        fuel_conn = sqlite3.connect("equipment_rental.db")
+        fuel_df = pd.read_sql_query("""
+            SELECT e.equipment_id, e.type, e.age,
+                   er.EngineHoursPerDay, er.IdleHoursPerDay, er.RentalDays,
+                   fc.fuel_less_than_5, fc.fuel_greater_than_or_equal_5
+            FROM equipment e
+            JOIN EquipmentRental er ON e.equipment_id = er.EquipmentID
+            JOIN fuel_consumption fc ON fc.equipment_type = e.type
+        """, fuel_conn)
+        fuel_conn.close()
+
+        if fuel_df.empty:
+            st.info("No fuel consumption data available.")
+        else:
+            fuel_df["fuel_rate"] = fuel_df.apply(
+                lambda r: r["fuel_less_than_5"] if r["age"] < 5 else r["fuel_greater_than_or_equal_5"], axis=1
+            )
+            fuel_df["engine_fuel"] = fuel_df["EngineHoursPerDay"] * fuel_df["fuel_rate"] * fuel_df["RentalDays"]
+            fuel_df["idle_fuel"] = fuel_df["IdleHoursPerDay"] * (fuel_df["fuel_rate"] * 0.25) * fuel_df["RentalDays"]
+            fuel_df["total_fuel"] = fuel_df["engine_fuel"] + fuel_df["idle_fuel"]
+
+            display_fuel = fuel_df[["equipment_id", "type", "age", "engine_fuel", "idle_fuel", "total_fuel"]].copy()
+            display_fuel.columns = ["Equipment", "Type", "Age", "Engine Fuel (L)", "Idle Fuel (L)", "Total Fuel (L)"]
+            for c in ["Engine Fuel (L)", "Idle Fuel (L)", "Total Fuel (L)"]:
+                display_fuel[c] = display_fuel[c].round(2)
+            st.dataframe(display_fuel, use_container_width=True, hide_index=True)
+
+            chart_data = display_fuel.set_index("Equipment")[["Engine Fuel (L)", "Idle Fuel (L)"]]
+            st.bar_chart(chart_data, color=["#f59e0b", "#3b82f6"])
+
 
 # =====================================================================
 # PAGE 4: ALERTS & REMINDERS
