@@ -21,7 +21,7 @@ TODAY = date.today()
 
 # --- Sidebar navigation ---
 st.sidebar.title("Navigation")
-page = st.sidebar.radio("Go to", ["Dashboard", "Check In / Out", "Usage Logging", "Alerts & Reminders", "Demand Forecasting", "Anomaly Detection", "Smart Scheduling"], label_visibility="collapsed")
+page = st.sidebar.radio("Go to", ["Dashboard", "Check In / Out", "Usage Logging", "Alerts & Reminders", "Demand Forecasting", "Anomaly Detection", "Smart Scheduling", "Predictive Maintenance", "Ask Fleet AI"], label_visibility="collapsed")
 
 
 # === Shared helpers ===
@@ -1427,41 +1427,7 @@ elif page == "Smart Scheduling":
                 st.markdown(f"**Available operators:** {', '.join(free_operators[:10])}")
 
         # =============================================================
-        # SECTION 2: OPERATOR EXPERIENCE — BY SITE
-        # =============================================================
-        st.markdown("---")
-        st.subheader("Operator Experience — By Site")
-        st.caption("Operators ranked by total rental days at each site")
-
-        site_filter = st.selectbox("Filter by Site", ["All"] + all_sites, key="exp_site")
-        site_display = site_exp.copy()
-        if site_filter != "All":
-            site_display = site_display[site_display["site_id"] == site_filter]
-
-        site_display["score"] = site_display.apply(compute_score, axis=1)
-        site_display = site_display.sort_values("score", ascending=False)
-        site_display.columns = ["Operator", "Site", "Rentals", "Total Days", "Utilization %", "On-Time %", "Score"]
-        st.dataframe(site_display, use_container_width=True, hide_index=True)
-
-        # =============================================================
-        # SECTION 3: OPERATOR EXPERIENCE — BY EQUIPMENT TYPE
-        # =============================================================
-        st.markdown("---")
-        st.subheader("Operator Experience — By Equipment Type")
-        st.caption("Operators ranked by total rental days with each equipment type")
-
-        type_filter = st.selectbox("Filter by Type", ["All"] + all_types, key="exp_type")
-        type_display = type_exp.copy()
-        if type_filter != "All":
-            type_display = type_display[type_display["equipment_type"] == type_filter]
-
-        type_display["score"] = type_display.apply(compute_score, axis=1)
-        type_display = type_display.sort_values("score", ascending=False)
-        type_display.columns = ["Operator", "Equipment Type", "Rentals", "Total Days", "Utilization %", "On-Time %", "Score"]
-        st.dataframe(type_display, use_container_width=True, hide_index=True)
-
-        # =============================================================
-        # SECTION 4: TOP OPERATORS OVERVIEW
+        # SECTION 2: TOP OPERATORS OVERVIEW
         # =============================================================
         st.markdown("---")
         st.subheader("Top Operators — Overall Performance")
@@ -1506,22 +1472,912 @@ elif page == "Smart Scheduling":
         st.markdown("")
         st.dataframe(overall, use_container_width=True, hide_index=True)
 
+
+# =====================================================================
+# PAGE 8: PREDICTIVE MAINTENANCE
+# =====================================================================
+elif page == "Predictive Maintenance":
+    st.markdown(
+        "<h1 style='text-align:center;'>Predictive Maintenance</h1>",
+        unsafe_allow_html=True,
+    )
+    st.caption("Predicts when equipment will need servicing based on cumulative engine hours, idle wear, and equipment age")
+
+    import os
+    SYNTH_DB = "equipment_rental_synthetic.db"
+    MAIN_DB = "equipment_rental.db"
+    maint_db = SYNTH_DB if os.path.exists(SYNTH_DB) else MAIN_DB
+    conn = sqlite3.connect(maint_db)
+
+    maint_df = pd.read_sql_query("""
+        SELECT r.equipment_id, e.type, e.age, e.status,
+               r.rental_days, r.is_returned,
+               r.engine_hours_per_day, r.idle_hours_per_day,
+               r.check_in_date, r.actual_return_date
+        FROM rentals r
+        JOIN equipment e ON r.equipment_id = e.equipment_id
+        WHERE r.operator_id IS NOT NULL
+          AND r.check_in_date IS NOT NULL AND r.check_in_date != '1900-01-01'
+        ORDER BY r.check_in_date
+    """, conn)
+    conn.close()
+
+    if maint_df.empty:
+        st.warning("No rental data available for maintenance predictions.")
+    else:
+        maint_df["check_in_date"] = pd.to_datetime(maint_df["check_in_date"])
+        maint_df["actual_return_date"] = pd.to_datetime(maint_df["actual_return_date"])
+        completed_m = maint_df[maint_df["is_returned"] == 1].copy()
+
+        # --- MAINTENANCE SCHEDULE PER EQUIPMENT TYPE ---
+        # Based on real heavy equipment OEM service intervals
+        # Each tier: (cumulative_engine_hours_threshold, service_name, components, est_cost, downtime_days)
+        MAINT_SCHEDULE = {
+            "Excavator": [
+                (250,  "Basic Service",        ["Engine oil & filter", "Air filter", "Coolant level", "Grease points"], 800, 1),
+                (500,  "Intermediate Service",  ["Hydraulic oil & filter", "Fuel filter", "Fan belts", "Battery check"], 2200, 2),
+                (1000, "Major Service",         ["Hydraulic pump inspection", "Undercarriage wear check", "Turbocharger", "Injector calibration"], 5500, 3),
+                (2000, "Engine Overhaul",       ["Piston rings & liners", "Main bearings", "Valve train", "Cooling system rebuild"], 15000, 7),
+                (4000, "Complete Rebuild",      ["Full engine rebuild", "Hydraulic system rebuild", "Track/undercarriage replace", "Electrical system overhaul"], 35000, 14),
+            ],
+            "Crane": [
+                (250,  "Basic Service",        ["Engine oil & filter", "Wire rope inspection", "Coolant level", "Grease points"], 900, 1),
+                (500,  "Intermediate Service",  ["Hydraulic oil & filter", "Brake pads", "Sheave inspection", "Load test"], 2800, 2),
+                (1000, "Major Service",         ["Boom structural inspection", "Slew ring bearing", "Outrigger cylinders", "Safety device calibration"], 7000, 4),
+                (2000, "Engine Overhaul",       ["Piston rings & liners", "Transmission rebuild", "Winch drum inspection", "Cooling system rebuild"], 18000, 7),
+                (4000, "Complete Rebuild",      ["Full engine rebuild", "Boom refurbishment", "Hydraulic system rebuild", "Electrical system overhaul"], 42000, 14),
+            ],
+            "Bulldozer": [
+                (250,  "Basic Service",        ["Engine oil & filter", "Air filter", "Track tension adjust", "Grease points"], 750, 1),
+                (500,  "Intermediate Service",  ["Hydraulic oil & filter", "Fuel filter", "Blade cutting edge check", "Fan belts"], 2000, 2),
+                (1000, "Major Service",         ["Final drive inspection", "Undercarriage measurement", "Turbocharger", "Steering clutch adjust"], 5000, 3),
+                (2000, "Engine Overhaul",       ["Piston rings & liners", "Main bearings", "Track chain replace", "Transmission rebuild"], 14000, 7),
+                (4000, "Complete Rebuild",      ["Full engine rebuild", "Undercarriage rebuild", "Hydraulic system rebuild", "Blade & ripper overhaul"], 32000, 14),
+            ],
+            "Grader": [
+                (250,  "Basic Service",        ["Engine oil & filter", "Air filter", "Tire pressure check", "Grease points"], 700, 1),
+                (500,  "Intermediate Service",  ["Hydraulic oil & filter", "Circle & moldboard wear", "Brake adjustment", "Fuel filter"], 1800, 2),
+                (1000, "Major Service",         ["Tandem drive inspection", "Articulation pins & bearings", "Turbocharger", "Scarifier teeth"], 4500, 3),
+                (2000, "Engine Overhaul",       ["Piston rings & liners", "Main bearings", "Transmission rebuild", "Circle gear replace"], 12000, 7),
+                (4000, "Complete Rebuild",      ["Full engine rebuild", "All-wheel-drive rebuild", "Hydraulic system rebuild", "Frame straighten & weld"], 28000, 14),
+            ],
+        }
+
+        # --- IDLE WEAR FACTOR ---
+        # Idling causes real damage: carbon buildup in cylinders, DPF clogging,
+        # fuel injector coking, wet stacking, coolant degradation, battery sulfation.
+        # Industry standard: 1 idle hour = 0.3 engine-equivalent wear hours.
+        IDLE_WEAR_FACTOR = 0.3
+
+        # --- AGE DEGRADATION ---
+        # Older machines need more frequent servicing: wear accelerates with age.
+        # Reduce effective service interval by 3% per year of age.
+        AGE_PENALTY_PER_YEAR = 0.03
+
+        # --- COMPONENT WEAR FROM IDLE ---
+        # Specific components degraded by excessive idling
+        IDLE_DAMAGE_COMPONENTS = [
+            {"component": "Diesel Particulate Filter (DPF)", "idle_hr_trigger": 300,
+             "issue": "Soot accumulation from incomplete combustion during idling", "action": "Forced regen or manual cleaning"},
+            {"component": "Fuel Injectors", "idle_hr_trigger": 500,
+             "issue": "Carbon deposits and coking from low-temp combustion", "action": "Ultrasonic cleaning or replacement"},
+            {"component": "Exhaust Gas Recirculation (EGR)", "idle_hr_trigger": 400,
+             "issue": "Carbon buildup restricting exhaust flow", "action": "EGR valve cleaning or replacement"},
+            {"component": "Coolant System", "idle_hr_trigger": 600,
+             "issue": "Coolant degradation from prolonged low-temp operation", "action": "Coolant flush and refill"},
+            {"component": "Battery & Alternator", "idle_hr_trigger": 700,
+             "issue": "Undercharging during idle leads to sulfation", "action": "Battery load test and replacement if needed"},
+            {"component": "Turbocharger Seals", "idle_hr_trigger": 800,
+             "issue": "Oil leakage past seals due to low exhaust pressure during idle", "action": "Turbo seal inspection and replacement"},
+        ]
+
+        # --- COMPUTE PER-EQUIPMENT MAINTENANCE STATUS ---
+        equip_list = []
+        for eq_id in completed_m["equipment_id"].unique():
+            eq_data = completed_m[completed_m["equipment_id"] == eq_id].sort_values("check_in_date")
+            eq_type = eq_data["type"].iloc[0]
+            eq_age = eq_data["age"].iloc[0]
+
+            total_engine_hrs = (eq_data["engine_hours_per_day"] * eq_data["rental_days"]).sum()
+            total_idle_hrs = (eq_data["idle_hours_per_day"] * eq_data["rental_days"]).sum()
+            total_days = eq_data["rental_days"].sum()
+            num_rentals = len(eq_data)
+
+            effective_hours = total_engine_hrs + (total_idle_hrs * IDLE_WEAR_FACTOR)
+
+            age_factor = 1 - (eq_age * AGE_PENALTY_PER_YEAR)
+            age_factor = max(age_factor, 0.5)
+
+            schedule = MAINT_SCHEDULE.get(eq_type, MAINT_SCHEDULE["Excavator"])
+            adjusted_schedule = [(thresh * age_factor, name, comps, cost, days) for thresh, name, comps, cost, days in schedule]
+
+            next_service = None
+            last_service = None
+            for thresh, name, comps, cost, dtime in adjusted_schedule:
+                if effective_hours < thresh:
+                    next_service = {"threshold": thresh, "name": name, "components": comps, "cost": cost, "downtime": dtime}
+                    break
+                last_service = {"threshold": thresh, "name": name}
+
+            if next_service is None:
+                last_tier = adjusted_schedule[-1]
+                next_service = {
+                    "threshold": last_tier[0], "name": "Complete Rebuild (OVERDUE)",
+                    "components": last_tier[2], "cost": last_tier[3], "downtime": last_tier[4],
+                }
+
+            hrs_remaining = max(next_service["threshold"] - effective_hours, 0)
+
+            avg_daily_engine = total_engine_hrs / total_days if total_days > 0 else 0
+            avg_daily_idle = total_idle_hrs / total_days if total_days > 0 else 0
+            avg_daily_effective = avg_daily_engine + (avg_daily_idle * IDLE_WEAR_FACTOR)
+            days_until_service = int(hrs_remaining / avg_daily_effective) if avg_daily_effective > 0 else 999
+
+            if days_until_service <= 0:
+                risk = "Critical"
+                risk_color = "#dc2626"
+            elif days_until_service <= 14:
+                risk = "High"
+                risk_color = "#ef4444"
+            elif days_until_service <= 30:
+                risk = "Warning"
+                risk_color = "#f59e0b"
+            elif days_until_service <= 60:
+                risk = "Monitor"
+                risk_color = "#3b82f6"
+            else:
+                risk = "Good"
+                risk_color = "#22c55e"
+
+            idle_ratio = total_idle_hrs / (total_engine_hrs + total_idle_hrs) * 100 if (total_engine_hrs + total_idle_hrs) > 0 else 0
+
+            idle_flags = []
+            for comp in IDLE_DAMAGE_COMPONENTS:
+                if total_idle_hrs >= comp["idle_hr_trigger"]:
+                    idle_flags.append(comp)
+
+            equip_list.append({
+                "equipment_id": eq_id,
+                "type": eq_type,
+                "age": eq_age,
+                "total_engine_hrs": round(total_engine_hrs, 1),
+                "total_idle_hrs": round(total_idle_hrs, 1),
+                "effective_hrs": round(effective_hours, 1),
+                "idle_ratio": round(idle_ratio, 1),
+                "avg_daily_engine": round(avg_daily_engine, 1),
+                "avg_daily_idle": round(avg_daily_idle, 1),
+                "next_service": next_service["name"],
+                "next_threshold": round(next_service["threshold"], 0),
+                "hrs_remaining": round(hrs_remaining, 1),
+                "days_until_service": days_until_service,
+                "est_cost": next_service["cost"],
+                "downtime_days": next_service["downtime"],
+                "components": next_service["components"],
+                "risk": risk,
+                "risk_color": risk_color,
+                "idle_flags": idle_flags,
+                "total_days": total_days,
+                "num_rentals": num_rentals,
+            })
+
+        equip_maint = pd.DataFrame(equip_list).sort_values("days_until_service")
+
         # =============================================================
-        # SECTION 5: EXPERIENCE HEATMAP — SITE vs TYPE
+        # SECTION 1: FLEET HEALTH SUMMARY
+        # =============================================================
+        risk_counts = equip_maint["risk"].value_counts().to_dict()
+        total_cost = equip_maint[equip_maint["days_until_service"] <= 30]["est_cost"].sum()
+
+        rc1, rc2, rc3, rc4, rc5, rc6 = st.columns(6)
+        for col, (lbl, clr) in zip(
+            [rc1, rc2, rc3, rc4, rc5],
+            [("Critical", "#dc2626"), ("High", "#ef4444"), ("Warning", "#f59e0b"), ("Monitor", "#3b82f6"), ("Good", "#22c55e")],
+        ):
+            cnt = risk_counts.get(lbl, 0)
+            col.markdown(
+                f"<div style='background:{clr}20; border-left:4px solid {clr}; padding:12px 16px; border-radius:8px; text-align:center;'>"
+                f"<div style='font-size:28px; font-weight:700; color:{clr};'>{cnt}</div>"
+                f"<div style='font-size:13px; color:{clr};'>{lbl}</div></div>",
+                unsafe_allow_html=True,
+            )
+        rc6.markdown(
+            f"<div style='background:#f59e0b20; border-left:4px solid #f59e0b; padding:12px 16px; border-radius:8px; text-align:center;'>"
+            f"<div style='font-size:28px; font-weight:700; color:#f59e0b;'>${total_cost:,.0f}</div>"
+            f"<div style='font-size:13px; color:#f59e0b;'>30-Day Maint. Budget</div></div>",
+            unsafe_allow_html=True,
+        )
+
+        # =============================================================
+        # SECTION 2: MAINTENANCE ALERTS
         # =============================================================
         st.markdown("---")
-        st.subheader("Operator Experience Heatmap")
-        st.caption("Number of completed rentals per operator across sites and equipment types")
+        st.subheader("Maintenance Alerts")
 
-        heatmap_view = st.radio("View by", ["Site", "Equipment Type"], horizontal=True, key="heatmap_view")
+        maint_filter = st.selectbox("Filter by Risk Level", ["All", "Critical", "High", "Warning", "Monitor", "Good"], key="maint_risk")
+        type_filter_m = st.selectbox("Filter by Equipment Type", ["All"] + sorted(equip_maint["type"].unique().tolist()), key="maint_type")
 
-        if heatmap_view == "Site":
-            pivot = completed.groupby(["operator_id", "site_id"])["equipment_id"].count().reset_index()
-            pivot.columns = ["Operator", "Site", "Rentals"]
-            pivot_table = pivot.pivot(index="Operator", columns="Site", values="Rentals").fillna(0).astype(int)
+        display_maint = equip_maint.copy()
+        if maint_filter != "All":
+            display_maint = display_maint[display_maint["risk"] == maint_filter]
+        if type_filter_m != "All":
+            display_maint = display_maint[display_maint["type"] == type_filter_m]
+
+        for _, eq in display_maint.iterrows():
+            clr = eq["risk_color"]
+
+            progress_pct = max(0, min(100, 100 - (eq["hrs_remaining"] / eq["next_threshold"] * 100))) if eq["next_threshold"] > 0 else 100
+
+            comp_list = " &nbsp;|&nbsp; ".join(eq["components"][:4])
+
+            st.markdown(
+                f"<div style='background:{clr}08; border-left:5px solid {clr}; padding:16px 20px; border-radius:8px; margin-bottom:10px;'>"
+                f"<div style='display:flex; justify-content:space-between; align-items:center;'>"
+                f"<div>"
+                f"<b style='font-size:17px;'>{eq['equipment_id']}</b> "
+                f"<span style='font-size:13px; color:#6b7280;'>({eq['type']} | Age: {eq['age']} yrs)</span>"
+                f"</div>"
+                f"<span style='background:{clr}25; color:{clr}; padding:3px 12px; border-radius:10px; font-size:12px; font-weight:700;'>"
+                f"{eq['risk']}</span>"
+                f"</div>"
+                f"<div style='margin-top:10px; display:flex; gap:24px; font-size:14px; color:#374151;'>"
+                f"<div><b>Next Service:</b> {eq['next_service']}</div>"
+                f"<div><b>Days Left:</b> {eq['days_until_service']}</div>"
+                f"<div><b>Est. Cost:</b> ${eq['est_cost']:,}</div>"
+                f"<div><b>Downtime:</b> {eq['downtime_days']} day{'s' if eq['downtime_days'] > 1 else ''}</div>"
+                f"</div>"
+                f"<div style='margin-top:8px; background:#e5e7eb; border-radius:6px; height:8px; overflow:hidden;'>"
+                f"<div style='background:{clr}; width:{progress_pct:.0f}%; height:100%; border-radius:6px;'></div>"
+                f"</div>"
+                f"<div style='display:flex; justify-content:space-between; font-size:11px; color:#9ca3af; margin-top:2px;'>"
+                f"<span>Effective: {eq['effective_hrs']} hrs</span>"
+                f"<span>Next at: {eq['next_threshold']:.0f} hrs ({progress_pct:.0f}% worn)</span>"
+                f"</div>"
+                f"<div style='margin-top:8px; font-size:12px; color:#6b7280;'>"
+                f"<b>Components:</b> {comp_list}"
+                f"</div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+        # =============================================================
+        # SECTION 3: IDLE EMISSION DAMAGE REPORT
+        # =============================================================
+        st.markdown("---")
+        st.subheader("Idle Wear & Emission Damage")
+        st.caption("Components degraded by excessive idling — carbon buildup, DPF clogging, coolant issues")
+
+        idle_report = []
+        for _, eq in equip_maint.iterrows():
+            for flag in eq["idle_flags"]:
+                idle_report.append({
+                    "Equipment": eq["equipment_id"],
+                    "Type": eq["type"],
+                    "Total Idle Hrs": eq["total_idle_hrs"],
+                    "Idle Ratio": f"{eq['idle_ratio']}%",
+                    "Component": flag["component"],
+                    "Issue": flag["issue"],
+                    "Action Required": flag["action"],
+                })
+
+        if idle_report:
+            idle_rpt_df = pd.DataFrame(idle_report)
+
+            comp_counts = idle_rpt_df["Component"].value_counts()
+            ic1, ic2, ic3 = st.columns(3)
+            ic1.metric("Equipment with Idle Damage", f"{idle_rpt_df['Equipment'].nunique()}/{len(equip_maint)}")
+            ic2.metric("Total Component Alerts", len(idle_report))
+            most_common = comp_counts.index[0] if len(comp_counts) > 0 else "N/A"
+            ic3.metric("Most Affected Component", most_common)
+
+            st.dataframe(idle_rpt_df, use_container_width=True, hide_index=True)
         else:
-            pivot = completed.groupby(["operator_id", "equipment_type"])["equipment_id"].count().reset_index()
-            pivot.columns = ["Operator", "Type", "Rentals"]
-            pivot_table = pivot.pivot(index="Operator", columns="Type", values="Rentals").fillna(0).astype(int)
+            st.success("No equipment has accumulated enough idle hours to trigger component damage alerts.")
 
-        st.dataframe(pivot_table.style.background_gradient(cmap="YlGn", axis=None), use_container_width=True)
+        # =============================================================
+        # SECTION 4: MAINTENANCE TIMELINE
+        # =============================================================
+        st.markdown("---")
+        st.subheader("Maintenance Timeline")
+        st.caption("When each equipment unit is predicted to need its next service")
+
+        timeline = equip_maint[["equipment_id", "type", "age", "next_service", "days_until_service",
+                                "hrs_remaining", "effective_hrs", "est_cost", "risk"]].copy()
+        timeline.columns = ["Equipment", "Type", "Age", "Next Service", "Days Until Service",
+                            "Hrs Remaining", "Effective Hrs", "Est. Cost ($)", "Risk"]
+        timeline = timeline.sort_values("Days Until Service")
+        st.dataframe(timeline, use_container_width=True, hide_index=True)
+
+        # =============================================================
+        # SECTION 5: MAINTENANCE COST PROJECTION
+        # =============================================================
+        st.markdown("---")
+        st.subheader("Maintenance Cost Projection")
+
+        cost_7d = equip_maint[equip_maint["days_until_service"] <= 7]["est_cost"].sum()
+        cost_14d = equip_maint[equip_maint["days_until_service"] <= 14]["est_cost"].sum()
+        cost_30d = equip_maint[equip_maint["days_until_service"] <= 30]["est_cost"].sum()
+        cost_60d = equip_maint[equip_maint["days_until_service"] <= 60]["est_cost"].sum()
+        cost_90d = equip_maint[equip_maint["days_until_service"] <= 90]["est_cost"].sum()
+
+        cc1, cc2, cc3, cc4, cc5 = st.columns(5)
+        for col, lbl, val, clr in [
+            (cc1, "Next 7 Days", cost_7d, "#dc2626"),
+            (cc2, "Next 14 Days", cost_14d, "#ef4444"),
+            (cc3, "Next 30 Days", cost_30d, "#f59e0b"),
+            (cc4, "Next 60 Days", cost_60d, "#3b82f6"),
+            (cc5, "Next 90 Days", cost_90d, "#22c55e"),
+        ]:
+            col.markdown(
+                f"<div style='background:{clr}20; border-left:4px solid {clr}; padding:12px 16px; border-radius:8px; text-align:center;'>"
+                f"<div style='font-size:24px; font-weight:700; color:{clr};'>${val:,.0f}</div>"
+                f"<div style='font-size:13px; color:{clr};'>{lbl}</div></div>",
+                unsafe_allow_html=True,
+            )
+
+        cost_by_type = equip_maint.groupby("type")["est_cost"].sum().reset_index()
+        cost_by_type.columns = ["Equipment Type", "Total Upcoming Cost ($)"]
+        cost_by_type = cost_by_type.sort_values("Total Upcoming Cost ($)", ascending=False)
+        st.bar_chart(cost_by_type.set_index("Equipment Type"), use_container_width=True)
+
+        # =============================================================
+        # SECTION 6: MAINTENANCE SCHEDULE REFERENCE
+        # =============================================================
+        st.markdown("---")
+        st.subheader("Maintenance Schedule Reference")
+        st.caption("Standard OEM service intervals per equipment type (adjusted by age)")
+
+        ref_type = st.selectbox("Select Equipment Type", list(MAINT_SCHEDULE.keys()), key="maint_ref")
+        ref_schedule = MAINT_SCHEDULE[ref_type]
+
+        for thresh, name, comps, cost, dtime in ref_schedule:
+            st.markdown(
+                f"<div style='background:#f3f4f615; border-left:4px solid #3b82f6; padding:12px 16px; border-radius:8px; margin-bottom:8px;'>"
+                f"<div style='display:flex; justify-content:space-between;'>"
+                f"<b>{name}</b>"
+                f"<span style='color:#6b7280;'>Every {int(thresh)} engine hrs &nbsp;|&nbsp; ~${cost:,} &nbsp;|&nbsp; {dtime} day{'s' if dtime > 1 else ''} downtime</span>"
+                f"</div>"
+                f"<div style='margin-top:6px; font-size:13px; color:#374151;'>"
+                + " &nbsp;&bull;&nbsp; ".join(comps)
+                + f"</div></div>",
+                unsafe_allow_html=True,
+            )
+
+
+# =====================================================================
+# PAGE 9: ASK FLEET AI
+# =====================================================================
+elif page == "Ask Fleet AI":
+    st.markdown(
+        "<h1 style='text-align:center;'>Ask Fleet AI</h1>",
+        unsafe_allow_html=True,
+    )
+    st.caption("Ask questions in plain English — the AI queries your fleet data and returns instant answers")
+
+    import os, re
+    SYNTH_DB = "equipment_rental_synthetic.db"
+    MAIN_DB = "equipment_rental.db"
+    ai_db = SYNTH_DB if os.path.exists(SYNTH_DB) else MAIN_DB
+    conn_ai = sqlite3.connect(ai_db)
+
+    @st.cache_data(ttl=120)
+    def load_fleet_data(_db_path):
+        conn = sqlite3.connect(_db_path)
+        rentals = pd.read_sql_query("""
+            SELECT r.*, e.type AS equipment_type, e.status, e.daily_rental_rate, e.age
+            FROM rentals r
+            JOIN equipment e ON r.equipment_id = e.equipment_id
+            WHERE r.check_in_date IS NOT NULL AND r.check_in_date != '1900-01-01'
+        """, conn)
+        equipment = pd.read_sql_query("SELECT * FROM equipment", conn)
+        conn.close()
+        rentals["check_in_date"] = pd.to_datetime(rentals["check_in_date"])
+        rentals["actual_return_date"] = pd.to_datetime(rentals["actual_return_date"])
+        rentals["expected_return_date"] = pd.to_datetime(rentals["expected_return_date"])
+        return rentals, equipment
+
+    rentals_ai, equipment_ai = load_fleet_data(ai_db)
+    conn_ai.close()
+
+    today_ai = pd.Timestamp(date.today())
+
+    def parse_time_range(query):
+        q = query.lower()
+        if "last month" in q:
+            start = (today_ai - pd.DateOffset(months=1)).replace(day=1)
+            end = today_ai.replace(day=1) - timedelta(days=1)
+            label = "Last Month"
+        elif "last 3 months" in q or "last three months" in q or "past 3 months" in q:
+            start = today_ai - pd.DateOffset(months=3)
+            end = today_ai
+            label = "Last 3 Months"
+        elif "last 6 months" in q or "last six months" in q or "past 6 months" in q:
+            start = today_ai - pd.DateOffset(months=6)
+            end = today_ai
+            label = "Last 6 Months"
+        elif "this year" in q or "current year" in q:
+            start = today_ai.replace(month=1, day=1)
+            end = today_ai
+            label = "This Year"
+        elif "last year" in q or "previous year" in q:
+            start = (today_ai - pd.DateOffset(years=1)).replace(month=1, day=1)
+            end = (today_ai - pd.DateOffset(years=1)).replace(month=12, day=31)
+            label = "Last Year"
+        elif "this month" in q:
+            start = today_ai.replace(day=1)
+            end = today_ai
+            label = "This Month"
+        elif "last week" in q:
+            start = today_ai - timedelta(days=7)
+            end = today_ai
+            label = "Last Week"
+        else:
+            start = rentals_ai["check_in_date"].min()
+            end = today_ai
+            label = "All Time"
+        return start, end, label
+
+    def extract_equipment_type(query):
+        q = query.lower()
+        for t in ["excavator", "crane", "bulldozer", "grader"]:
+            if t in q:
+                return t.title()
+        return None
+
+    def extract_site(query):
+        match = re.search(r's\d{3}', query, re.IGNORECASE)
+        return match.group(0).upper() if match else None
+
+    def extract_operator(query):
+        match = re.search(r'op\d{3}', query, re.IGNORECASE)
+        return match.group(0).upper() if match else None
+
+    def classify_intent(query):
+        q = query.lower()
+        if any(w in q for w in ["underutiliz", "idle", "low utiliz", "wast", "not used", "unused", "sitting"]):
+            return "underutilized"
+        if any(w in q for w in ["overutiliz", "high utiliz", "most used", "heavily used", "busiest", "hardest working"]):
+            return "overutilized"
+        if any(w in q for w in ["overdue", "late", "past due", "not returned", "delayed"]):
+            return "overdue"
+        if any(w in q for w in ["available", "free", "not rented", "idle equipment", "not in use"]):
+            return "available"
+        if any(w in q for w in ["revenue", "income", "earning", "money", "profit", "cost"]):
+            return "revenue"
+        if any(w in q for w in ["maintenance", "service", "repair", "breakdown", "fix"]):
+            return "maintenance"
+        if any(w in q for w in ["operator", "who operated", "best operator", "top operator", "experienced"]):
+            return "operator"
+        if any(w in q for w in ["site", "location", "which site", "busiest site", "most active site"]):
+            return "site"
+        if any(w in q for w in ["how many", "count", "total", "number of"]):
+            return "count"
+        if any(w in q for w in ["trend", "pattern", "over time", "history", "monthly", "weekly"]):
+            return "trend"
+        if any(w in q for w in ["forecast", "predict", "next month", "future", "expect"]):
+            return "forecast"
+        if any(w in q for w in ["compare", "vs", "versus", "difference between"]):
+            return "compare"
+        if any(w in q for w in ["longest", "shortest", "most days", "fewest", "maximum", "minimum"]):
+            return "extreme"
+        if any(w in q for w in ["status", "summary", "overview", "fleet health", "dashboard"]):
+            return "summary"
+        return "general"
+
+    def render_answer_card(title, value, color="#3b82f6"):
+        st.markdown(
+            f"<div style='background:{color}15; border-left:5px solid {color}; "
+            f"padding:14px 18px; border-radius:8px; margin-bottom:10px;'>"
+            f"<div style='font-size:13px; color:{color}; font-weight:600; text-transform:uppercase;'>{title}</div>"
+            f"<div style='font-size:22px; font-weight:700; margin-top:4px;'>{value}</div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+    def process_query(query):
+        intent = classify_intent(query)
+        eq_type = extract_equipment_type(query)
+        site = extract_site(query)
+        operator = extract_operator(query)
+        start, end, time_label = parse_time_range(query)
+
+        data = rentals_ai.copy()
+        time_filtered = data[(data["check_in_date"] >= start) & (data["check_in_date"] <= end)]
+        if eq_type:
+            time_filtered = time_filtered[time_filtered["equipment_type"] == eq_type]
+        if site:
+            time_filtered = time_filtered[time_filtered["site_id"] == site]
+        if operator:
+            time_filtered = time_filtered[time_filtered["operator_id"] == operator]
+
+        completed = time_filtered[time_filtered["is_returned"] == 1].copy()
+        if not completed.empty:
+            completed["utilization"] = completed["engine_hours_per_day"] / (
+                completed["engine_hours_per_day"] + completed["idle_hours_per_day"]
+            ).replace(0, float("nan"))
+
+        type_label = eq_type if eq_type else "All Equipment"
+        scope = f"{type_label} | {time_label}"
+        if site:
+            scope += f" | Site: {site}"
+        if operator:
+            scope += f" | Operator: {operator}"
+
+        st.markdown(f"**Scope:** {scope}")
+        st.markdown(f"**Records found:** {len(time_filtered)} rentals ({len(completed)} completed)")
+        st.markdown("---")
+
+        if intent == "underutilized":
+            if completed.empty:
+                st.info("No completed rentals found for this filter.")
+                return
+            equip_util = completed.groupby(["equipment_id", "equipment_type"]).agg(
+                avg_util=("utilization", "mean"),
+                avg_engine=("engine_hours_per_day", "mean"),
+                avg_idle=("idle_hours_per_day", "mean"),
+                total_days=("rental_days", "sum"),
+                rentals=("equipment_id", "count"),
+            ).reset_index()
+            equip_util["avg_util"] = (equip_util["avg_util"] * 100).round(1)
+            equip_util["avg_engine"] = equip_util["avg_engine"].round(1)
+            equip_util["avg_idle"] = equip_util["avg_idle"].round(1)
+            under = equip_util[equip_util["avg_util"] < 60].sort_values("avg_util")
+
+            render_answer_card("Underutilized Equipment (<60% utilization)", f"{len(under)} out of {len(equip_util)} units", "#f59e0b")
+
+            if not under.empty:
+                under_display = under.copy()
+                under_display.columns = ["Equipment", "Type", "Utilization %", "Avg Engine Hrs/Day", "Avg Idle Hrs/Day", "Total Days", "Rentals"]
+                st.dataframe(under_display, use_container_width=True, hide_index=True)
+                st.bar_chart(under.set_index("equipment_id")["avg_util"], use_container_width=True)
+            else:
+                st.success("All equipment is well-utilized (>60%).")
+
+        elif intent == "overutilized":
+            if completed.empty:
+                st.info("No completed rentals found.")
+                return
+            equip_util = completed.groupby(["equipment_id", "equipment_type"]).agg(
+                avg_util=("utilization", "mean"),
+                avg_engine=("engine_hours_per_day", "mean"),
+                total_days=("rental_days", "sum"),
+                rentals=("equipment_id", "count"),
+            ).reset_index()
+            equip_util["avg_util"] = (equip_util["avg_util"] * 100).round(1)
+            equip_util["avg_engine"] = equip_util["avg_engine"].round(1)
+            top = equip_util.sort_values("avg_util", ascending=False).head(10)
+
+            render_answer_card("Most Utilized Equipment (Top 10)", f"Highest: {top.iloc[0]['avg_util']}%", "#22c55e")
+
+            top_display = top.copy()
+            top_display.columns = ["Equipment", "Type", "Utilization %", "Avg Engine Hrs/Day", "Total Days", "Rentals"]
+            st.dataframe(top_display, use_container_width=True, hide_index=True)
+
+        elif intent == "overdue":
+            active = time_filtered[(time_filtered["is_returned"] == 0) & (time_filtered["expected_return_date"].notna())]
+            overdue = active[active["expected_return_date"] < today_ai].copy()
+            if not overdue.empty:
+                overdue["days_overdue"] = (today_ai - overdue["expected_return_date"]).dt.days
+            render_answer_card("Overdue Equipment", f"{len(overdue)} units past due date", "#ef4444")
+
+            if not overdue.empty:
+                ov_display = overdue[["equipment_id", "equipment_type", "operator_id", "site_id", "expected_return_date", "days_overdue"]].copy()
+                ov_display.columns = ["Equipment", "Type", "Operator", "Site", "Expected Return", "Days Overdue"]
+                ov_display = ov_display.sort_values("Days Overdue", ascending=False)
+                st.dataframe(ov_display, use_container_width=True, hide_index=True)
+            else:
+                st.success("No overdue equipment found.")
+
+        elif intent == "available":
+            avail = equipment_ai[equipment_ai["status"] == "available"]
+            if eq_type:
+                avail = avail[avail["type"] == eq_type]
+            render_answer_card("Available Equipment", f"{len(avail)} units ready for rental", "#22c55e")
+
+            if not avail.empty:
+                avail_display = avail[["equipment_id", "type", "daily_rental_rate", "age"]].copy()
+                avail_display.columns = ["Equipment", "Type", "Daily Rate ($)", "Age (yrs)"]
+                st.dataframe(avail_display, use_container_width=True, hide_index=True)
+
+                type_counts = avail["type"].value_counts().reset_index()
+                type_counts.columns = ["Type", "Count"]
+                st.bar_chart(type_counts.set_index("Type"), use_container_width=True)
+
+        elif intent == "revenue":
+            if completed.empty:
+                st.info("No completed rentals found.")
+                return
+            completed_rev = completed.copy()
+            completed_rev["revenue"] = completed_rev["rental_days"] * completed_rev["daily_rental_rate"]
+            total_rev = completed_rev["revenue"].sum()
+
+            render_answer_card("Total Revenue", f"${total_rev:,.0f}", "#22c55e")
+
+            rev_by_type = completed_rev.groupby("equipment_type")["revenue"].sum().reset_index()
+            rev_by_type.columns = ["Type", "Revenue ($)"]
+            rev_by_type["Revenue ($)"] = rev_by_type["Revenue ($)"].round(0).astype(int)
+            rev_by_type = rev_by_type.sort_values("Revenue ($)", ascending=False)
+
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("**Revenue by Equipment Type**")
+                st.dataframe(rev_by_type, use_container_width=True, hide_index=True)
+            with c2:
+                st.bar_chart(rev_by_type.set_index("Type"), use_container_width=True)
+
+            if not site:
+                rev_by_site = completed_rev.groupby("site_id")["revenue"].sum().reset_index()
+                rev_by_site.columns = ["Site", "Revenue ($)"]
+                rev_by_site = rev_by_site.sort_values("Revenue ($)", ascending=False).head(10)
+                st.markdown("**Top 10 Sites by Revenue**")
+                st.bar_chart(rev_by_site.set_index("Site"), use_container_width=True)
+
+        elif intent == "operator":
+            if completed.empty:
+                st.info("No completed rentals found.")
+                return
+            completed_op = completed.copy()
+            completed_op["was_on_time"] = (completed_op["actual_return_date"] <= completed_op["expected_return_date"]).astype(int)
+
+            op_stats = completed_op.groupby("operator_id").agg(
+                total_rentals=("equipment_id", "count"),
+                total_days=("rental_days", "sum"),
+                avg_util=("utilization", "mean"),
+                on_time=("was_on_time", "mean"),
+                sites=("site_id", "nunique"),
+                types=("equipment_type", "nunique"),
+            ).reset_index()
+            op_stats["avg_util"] = (op_stats["avg_util"] * 100).round(1)
+            op_stats["on_time"] = (op_stats["on_time"] * 100).round(1)
+            op_stats = op_stats.sort_values("total_rentals", ascending=False)
+
+            best = op_stats.iloc[0]
+            render_answer_card("Top Operator by Experience",
+                f"{best['operator_id']} — {int(best['total_rentals'])} rentals, {best['avg_util']}% utilization, {best['on_time']}% on-time", "#3b82f6")
+
+            op_stats.columns = ["Operator", "Rentals", "Total Days", "Utilization %", "On-Time %", "Sites", "Types"]
+            st.dataframe(op_stats.head(15), use_container_width=True, hide_index=True)
+
+        elif intent == "site":
+            if time_filtered.empty:
+                st.info("No rental data found.")
+                return
+            site_stats = time_filtered.groupby("site_id").agg(
+                total_rentals=("equipment_id", "count"),
+                unique_eq=("equipment_id", "nunique"),
+                total_days=("rental_days", "sum"),
+                unique_types=("equipment_type", "nunique"),
+            ).reset_index()
+            site_stats = site_stats.sort_values("total_rentals", ascending=False)
+
+            busiest = site_stats.iloc[0]
+            render_answer_card("Busiest Site",
+                f"{busiest['site_id']} — {int(busiest['total_rentals'])} rentals, {int(busiest['unique_eq'])} equipment units", "#a855f7")
+
+            site_stats.columns = ["Site", "Rentals", "Unique Equipment", "Total Days", "Equipment Types"]
+            st.dataframe(site_stats, use_container_width=True, hide_index=True)
+            st.bar_chart(site_stats.set_index("Site")["Rentals"], use_container_width=True)
+
+        elif intent == "count":
+            q = query.lower()
+            if "active" in q or "rented" in q or "in use" in q:
+                active = equipment_ai[equipment_ai["status"].isin(["rented", "overdue"])]
+                if eq_type:
+                    active = active[active["type"] == eq_type]
+                render_answer_card("Currently Active / Rented", f"{len(active)} units", "#3b82f6")
+                if not active.empty:
+                    st.dataframe(active[["equipment_id", "type", "status"]], use_container_width=True, hide_index=True)
+            else:
+                render_answer_card("Total Rentals in Period", f"{len(time_filtered)} rental records", "#3b82f6")
+                by_type = time_filtered.groupby("equipment_type")["equipment_id"].count().reset_index()
+                by_type.columns = ["Type", "Count"]
+                st.bar_chart(by_type.set_index("Type"), use_container_width=True)
+
+        elif intent == "trend":
+            if time_filtered.empty:
+                st.info("No data found.")
+                return
+            weekly = time_filtered.set_index("check_in_date").resample("W")["equipment_id"].count().reset_index()
+            weekly.columns = ["Week", "Rentals"]
+
+            render_answer_card("Rental Trend", f"{len(weekly)} weeks of data | Avg: {weekly['Rentals'].mean():.1f}/week", "#3b82f6")
+            st.line_chart(weekly, x="Week", y="Rentals", use_container_width=True)
+
+            if eq_type is None:
+                monthly_type = time_filtered.copy()
+                monthly_type["month"] = monthly_type["check_in_date"].dt.to_period("M").dt.to_timestamp()
+                pivot = monthly_type.groupby(["month", "equipment_type"])["equipment_id"].count().reset_index()
+                pivot.columns = ["Month", "Type", "Rentals"]
+                pivot_wide = pivot.pivot(index="Month", columns="Type", values="Rentals").fillna(0)
+                st.markdown("**Trend by Equipment Type**")
+                st.line_chart(pivot_wide, use_container_width=True)
+
+        elif intent == "forecast":
+            if completed.empty:
+                st.info("Not enough data.")
+                return
+            monthly = completed.set_index("check_in_date").resample("MS")["equipment_id"].count()
+            if len(monthly) >= 2:
+                window = min(3, len(monthly))
+                ma = monthly.rolling(window).mean().dropna()
+                avg_monthly = ma.iloc[-1]
+                avg_daily = avg_monthly / 30
+
+                render_answer_card("Forecast (Moving Average)",
+                    f"~{avg_monthly:.0f} rentals/month | ~{avg_daily * 30:.0f} next 30 days", "#a855f7")
+
+                fc_dates = pd.date_range(monthly.index.max() + timedelta(days=1), periods=90, freq="D")
+                fc_weekly = pd.Series(avg_daily, index=fc_dates).resample("W").sum().reset_index()
+                fc_weekly.columns = ["Week", "Predicted"]
+                fc_weekly["Predicted"] = fc_weekly["Predicted"].round(1)
+                st.bar_chart(fc_weekly, x="Week", y="Predicted", use_container_width=True)
+
+        elif intent == "maintenance":
+            equip_data = equipment_ai.copy()
+            if eq_type:
+                equip_data = equip_data[equip_data["type"] == eq_type]
+            completed_m = rentals_ai[rentals_ai["is_returned"] == 1].copy()
+
+            maint_list = []
+            for eq_id in equip_data["equipment_id"]:
+                eq_rentals = completed_m[completed_m["equipment_id"] == eq_id]
+                if eq_rentals.empty:
+                    continue
+                total_eng = (eq_rentals["engine_hours_per_day"] * eq_rentals["rental_days"]).sum()
+                total_idle = (eq_rentals["idle_hours_per_day"] * eq_rentals["rental_days"]).sum()
+                eff = total_eng + total_idle * 0.3
+                eq_age = equip_data[equip_data["equipment_id"] == eq_id]["age"].iloc[0]
+                age_factor = max(1 - eq_age * 0.03, 0.5)
+                rebuild_thresh = 4000 * age_factor
+                hrs_left = max(rebuild_thresh - eff, 0)
+                total_days_r = eq_rentals["rental_days"].sum()
+                daily_rate = (total_eng / total_days_r + total_idle / total_days_r * 0.3) if total_days_r > 0 else 1
+                days_left = int(hrs_left / daily_rate) if daily_rate > 0 else 999
+                maint_list.append({
+                    "Equipment": eq_id,
+                    "Type": equip_data[equip_data["equipment_id"] == eq_id]["type"].iloc[0],
+                    "Age": eq_age,
+                    "Effective Hrs": round(eff, 0),
+                    "Next Service At": round(rebuild_thresh, 0),
+                    "Days Until Service": days_left,
+                })
+
+            maint_df = pd.DataFrame(maint_list).sort_values("Days Until Service")
+            urgent = maint_df[maint_df["Days Until Service"] <= 14]
+
+            render_answer_card("Equipment Needing Service Soon",
+                f"{len(urgent)} units need service within 14 days", "#ef4444")
+            st.dataframe(maint_df, use_container_width=True, hide_index=True)
+
+        elif intent == "compare":
+            if completed.empty:
+                st.info("No completed rentals found.")
+                return
+            comp = completed.groupby("equipment_type").agg(
+                rentals=("equipment_id", "count"),
+                avg_days=("rental_days", "mean"),
+                avg_engine=("engine_hours_per_day", "mean"),
+                avg_idle=("idle_hours_per_day", "mean"),
+                avg_util=("utilization", "mean"),
+                revenue=("daily_rental_rate", lambda x: (x * completed.loc[x.index, "rental_days"]).sum()),
+            ).reset_index()
+            comp["avg_days"] = comp["avg_days"].round(1)
+            comp["avg_engine"] = comp["avg_engine"].round(1)
+            comp["avg_idle"] = comp["avg_idle"].round(1)
+            comp["avg_util"] = (comp["avg_util"] * 100).round(1)
+            comp["revenue"] = comp["revenue"].round(0).astype(int)
+            comp.columns = ["Type", "Rentals", "Avg Days", "Avg Engine Hrs", "Avg Idle Hrs", "Utilization %", "Revenue ($)"]
+
+            render_answer_card("Equipment Type Comparison", f"{len(comp)} types compared", "#3b82f6")
+            st.dataframe(comp, use_container_width=True, hide_index=True)
+
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("**Utilization by Type**")
+                st.bar_chart(comp.set_index("Type")["Utilization %"], use_container_width=True)
+            with c2:
+                st.markdown("**Revenue by Type**")
+                st.bar_chart(comp.set_index("Type")["Revenue ($)"], use_container_width=True)
+
+        elif intent == "extreme":
+            if completed.empty:
+                st.info("No completed rentals found.")
+                return
+            q = query.lower()
+            if "longest" in q or "most days" in q or "maximum" in q:
+                top_rental = completed.sort_values("rental_days", ascending=False).head(10)
+                render_answer_card("Longest Rentals", f"Max: {int(top_rental.iloc[0]['rental_days'])} days", "#f59e0b")
+                display = top_rental[["equipment_id", "equipment_type", "operator_id", "site_id", "rental_days", "check_in_date"]].copy()
+                display.columns = ["Equipment", "Type", "Operator", "Site", "Rental Days", "Check-In"]
+                st.dataframe(display, use_container_width=True, hide_index=True)
+            else:
+                short_rental = completed[completed["rental_days"] > 0].sort_values("rental_days").head(10)
+                render_answer_card("Shortest Rentals", f"Min: {int(short_rental.iloc[0]['rental_days'])} days", "#3b82f6")
+                display = short_rental[["equipment_id", "equipment_type", "operator_id", "site_id", "rental_days", "check_in_date"]].copy()
+                display.columns = ["Equipment", "Type", "Operator", "Site", "Rental Days", "Check-In"]
+                st.dataframe(display, use_container_width=True, hide_index=True)
+
+        elif intent == "summary":
+            total_eq = len(equipment_ai)
+            avail = len(equipment_ai[equipment_ai["status"] == "available"])
+            rented = len(equipment_ai[equipment_ai["status"].isin(["rented", "overdue"])])
+            overdue_cnt = len(equipment_ai[equipment_ai["status"] == "overdue"])
+            total_rentals = len(time_filtered)
+
+            sc1, sc2, sc3, sc4 = st.columns(4)
+            for col, lbl, val, clr in [
+                (sc1, "Fleet Size", total_eq, "#3b82f6"),
+                (sc2, "Available", avail, "#22c55e"),
+                (sc3, "Rented", rented, "#f59e0b"),
+                (sc4, "Overdue", overdue_cnt, "#ef4444"),
+            ]:
+                col.markdown(
+                    f"<div style='background:{clr}20; border-left:4px solid {clr}; padding:12px; border-radius:8px; text-align:center;'>"
+                    f"<div style='font-size:28px; font-weight:700; color:{clr};'>{val}</div>"
+                    f"<div style='font-size:13px; color:{clr};'>{lbl}</div></div>",
+                    unsafe_allow_html=True,
+                )
+            st.markdown("---")
+            type_summary = equipment_ai.groupby("type")["status"].value_counts().unstack(fill_value=0).reset_index()
+            st.dataframe(type_summary, use_container_width=True, hide_index=True)
+
+        else:
+            st.markdown("**Here's a general overview based on your query:**")
+            render_answer_card("Rentals in Scope", f"{len(time_filtered)} records", "#3b82f6")
+
+            if not time_filtered.empty:
+                by_type = time_filtered.groupby("equipment_type")["equipment_id"].count().reset_index()
+                by_type.columns = ["Type", "Rentals"]
+                st.bar_chart(by_type.set_index("Type"), use_container_width=True)
+
+                if not completed.empty:
+                    avg_days = completed["rental_days"].mean()
+                    avg_eng = completed["engine_hours_per_day"].mean()
+                    avg_idle = completed["idle_hours_per_day"].mean()
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("Avg Rental Days", f"{avg_days:.1f}")
+                    m2.metric("Avg Engine Hrs/Day", f"{avg_eng:.1f}")
+                    m3.metric("Avg Idle Hrs/Day", f"{avg_idle:.1f}")
+
+            st.info("Try asking something more specific — see the suggested questions below.")
+
+    # --- SUGGESTED QUESTIONS ---
+    st.markdown("#### Ask a Question")
+
+    if "fleet_ai_picked" not in st.session_state:
+        st.session_state.fleet_ai_picked = ""
+
+    suggested = [
+        "Which excavators were underutilized last month?",
+        "Show me all overdue equipment",
+        "Who is the best crane operator?",
+        "What's the total revenue this year?",
+        "Which site has the most rentals?",
+        "Compare all equipment types",
+        "Show rental trends for last 6 months",
+        "How many bulldozers are available?",
+        "Which equipment needs maintenance soon?",
+        "What are the longest rentals this year?",
+        "Give me a fleet summary",
+        "Forecast demand for next month",
+    ]
+
+    st.markdown("**Quick queries** — click any to run instantly:")
+    cols = st.columns(3)
+    for i, q in enumerate(suggested):
+        if cols[i % 3].button(q, key=f"sq_{i}", use_container_width=True):
+            st.session_state.fleet_ai_picked = q
+
+    st.markdown("---")
+    user_query = st.text_input(
+        "Or type your own question...",
+        placeholder="e.g., Which excavators were underutilized last month?",
+        key="fleet_ai_query",
+    )
+
+    active_query = user_query.strip() if user_query.strip() else st.session_state.fleet_ai_picked
+
+    if active_query:
+        st.markdown("---")
+        st.markdown(f"**Question:** *{active_query}*")
+        st.markdown("")
+        process_query(active_query)
