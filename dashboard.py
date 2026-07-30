@@ -10,7 +10,7 @@ TODAY = date.today()
 
 # --- Sidebar navigation ---
 st.sidebar.title("Navigation")
-page = st.sidebar.radio("Go to", ["Dashboard", "Check In / Out"], label_visibility="collapsed")
+page = st.sidebar.radio("Go to", ["Dashboard", "Check In / Out", "Usage Logging"], label_visibility="collapsed")
 
 
 # === Shared helpers ===
@@ -31,7 +31,8 @@ def status_color(status):
         "rented": "#3b82f6",
         "overdue": "#ef4444",
         "unknown": "#f59e0b",
-        "flagged": "#a855f7",
+        "flagged": "#a855"
+        "f7",
     }.get(status, "#6b7280")
 
 
@@ -371,3 +372,147 @@ elif page == "Check In / Out":
                     )
 
     conn.close()
+
+
+# =====================================================================
+# PAGE 3: USAGE LOGGING
+# =====================================================================
+elif page == "Usage Logging":
+    st.markdown(
+        "<h1 style='text-align:center;'>Usage Logging & Summary</h1>",
+        unsafe_allow_html=True,
+    )
+
+    conn = sqlite3.connect("equipment_rental.db")
+
+    usage_df = pd.read_sql_query("""
+        SELECT r.id, r.equipment_id, e.type, r.operator_id, r.site_id,
+               r.check_in_date, r.actual_return_date, r.expected_return_date,
+               r.rental_days, r.is_returned,
+               r.engine_hours_per_day, r.idle_hours_per_day,
+               e.daily_rental_rate
+        FROM rentals r
+        JOIN equipment e ON r.equipment_id = e.equipment_id
+        ORDER BY r.id DESC
+    """, conn)
+
+    conn.close()
+
+    if usage_df.empty:
+        st.info("No rental records found.")
+    else:
+        # --- Filters ---
+        col_f1, col_f2, col_f3, col_f4 = st.columns(4)
+        with col_f1:
+            type_opts = ["All"] + sorted(usage_df["type"].dropna().unique().tolist())
+            sel_type = st.selectbox("Equipment Type", type_opts)
+        with col_f2:
+            if sel_type != "All":
+                eq_pool = usage_df[usage_df["type"] == sel_type]["equipment_id"].dropna().unique().tolist()
+            else:
+                eq_pool = usage_df["equipment_id"].dropna().unique().tolist()
+            eq_opts = ["All"] + sorted(eq_pool)
+            sel_eq = st.selectbox("Equipment", eq_opts)
+        with col_f3:
+            site_opts = ["All"] + sorted(usage_df["site_id"].dropna().unique().tolist())
+            sel_site = st.selectbox("Site", site_opts)
+        with col_f4:
+            show_filter = st.selectbox("Show", ["All Rentals", "Active Only", "Returned Only"])
+
+        filt = usage_df.copy()
+        if sel_eq != "All":
+            filt = filt[filt["equipment_id"] == sel_eq]
+        if sel_type != "All":
+            filt = filt[filt["type"] == sel_type]
+        if sel_site != "All":
+            filt = filt[filt["site_id"] == sel_site]
+        if show_filter == "Active Only":
+            filt = filt[filt["is_returned"] == 0]
+        elif show_filter == "Returned Only":
+            filt = filt[filt["is_returned"] == 1]
+
+        returned = filt[filt["is_returned"] == 1]
+
+        # --- Summary Cards ---
+        total_rental_days = returned["rental_days"].sum()
+        total_engine_hrs = (returned["engine_hours_per_day"] * returned["rental_days"]).sum()
+        total_idle_hrs = (returned["idle_hours_per_day"] * returned["rental_days"]).sum()
+        total_runtime_hrs = total_engine_hrs + total_idle_hrs
+        active_count = len(filt[filt["is_returned"] == 0])
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        for col, label, value, color in [
+            (c1, "Total Rented Days", f"{int(total_rental_days)}", "#3b82f6"),
+            (c2, "Total Runtime Hrs", f"{total_runtime_hrs:.1f}", "#22c55e"),
+            (c3, "Total Engine Hrs", f"{total_engine_hrs:.1f}", "#f59e0b"),
+            (c4, "Total Idle Hrs", f"{total_idle_hrs:.1f}", "#ef4444"),
+            (c5, "Active Rentals", f"{active_count}", "#a855f7"),
+        ]:
+            col.markdown(
+                f"""
+                <div style="
+                    background:{color}20; border-left:4px solid {color};
+                    padding:12px 16px; border-radius:8px; text-align:center;">
+                    <div style="font-size:28px; font-weight:700; color:{color};">{value}</div>
+                    <div style="font-size:13px; color:{color};">{label}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("---")
+
+        # --- Usage Per Site ---
+        st.subheader("Usage Per Site")
+        if not returned.empty:
+            site_summary = returned.groupby("site_id").agg(
+                rentals=("id", "count"),
+                total_days=("rental_days", "sum"),
+                avg_engine_hrs=("engine_hours_per_day", "mean"),
+                avg_idle_hrs=("idle_hours_per_day", "mean"),
+            ).reset_index()
+            site_summary.columns = ["Site", "Rentals", "Total Days", "Avg Engine Hrs/Day", "Avg Idle Hrs/Day"]
+            site_summary["Avg Engine Hrs/Day"] = site_summary["Avg Engine Hrs/Day"].round(1)
+            site_summary["Avg Idle Hrs/Day"] = site_summary["Avg Idle Hrs/Day"].round(1)
+            st.dataframe(site_summary, use_container_width=True, hide_index=True)
+        else:
+            st.info("No completed rentals to summarize.")
+
+        st.markdown("---")
+
+        # --- Detailed Usage Log ---
+        st.subheader("Detailed Usage Log")
+
+        log_display = filt[["equipment_id", "type", "operator_id", "site_id",
+                            "check_in_date", "actual_return_date", "rental_days",
+                            "engine_hours_per_day", "idle_hours_per_day", "is_returned"]].copy()
+        log_display["status"] = log_display["is_returned"].map({0: "🔵 Active", 1: "✅ Returned"})
+        log_display["total_engine_hrs"] = (log_display["engine_hours_per_day"] * log_display["rental_days"]).round(1)
+        log_display["total_idle_hrs"] = (log_display["idle_hours_per_day"] * log_display["rental_days"]).round(1)
+        log_display = log_display.drop(columns=["is_returned"])
+        log_display.columns = ["Equipment", "Type", "Operator", "Site",
+                               "Check-In", "Return Date", "Days",
+                               "Engine Hrs/Day", "Idle Hrs/Day", "Status",
+                               "Total Engine Hrs", "Total Idle Hrs"]
+        st.dataframe(log_display, use_container_width=True, hide_index=True)
+
+        st.markdown("---")
+
+        # --- Downtime Analysis ---
+        st.subheader("Downtime Analysis")
+        if not returned.empty:
+            returned_copy = returned.copy()
+            returned_copy["idle_ratio"] = (
+                returned_copy["idle_hours_per_day"] /
+                (returned_copy["engine_hours_per_day"] + returned_copy["idle_hours_per_day"]).replace(0, float("nan"))
+            ) * 100
+            downtime = returned_copy.groupby("equipment_id").agg(
+                total_days=("rental_days", "sum"),
+                avg_idle_pct=("idle_ratio", "mean"),
+            ).reset_index()
+            downtime.columns = ["Equipment", "Total Rental Days", "Avg Idle %"]
+            downtime["Avg Idle %"] = downtime["Avg Idle %"].round(1)
+            downtime = downtime.sort_values("Avg Idle %", ascending=False)
+            st.dataframe(downtime, use_container_width=True, hide_index=True)
+        else:
+            st.info("No completed rentals for downtime analysis.")
