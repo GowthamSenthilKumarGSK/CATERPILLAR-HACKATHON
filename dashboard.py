@@ -10,7 +10,7 @@ TODAY = date.today()
 
 # --- Sidebar navigation ---
 st.sidebar.title("Navigation")
-page = st.sidebar.radio("Go to", ["Dashboard", "Check In / Out", "Usage Logging"], label_visibility="collapsed")
+page = st.sidebar.radio("Go to", ["Dashboard", "Check In / Out", "Usage Logging", "Alerts & Reminders"], label_visibility="collapsed")
 
 
 # === Shared helpers ===
@@ -516,3 +516,157 @@ elif page == "Usage Logging":
             st.dataframe(downtime, use_container_width=True, hide_index=True)
         else:
             st.info("No completed rentals for downtime analysis.")
+
+
+# =====================================================================
+# PAGE 4: ALERTS & REMINDERS
+# =====================================================================
+elif page == "Alerts & Reminders":
+    st.markdown(
+        "<h1 style='text-align:center;'>Alerts & Reminders</h1>",
+        unsafe_allow_html=True,
+    )
+
+    conn = sqlite3.connect("equipment_rental.db")
+
+    open_rentals = pd.read_sql_query("""
+        SELECT r.id, r.equipment_id, e.type, r.operator_id, r.site_id,
+               r.check_in_date, r.expected_return_date
+        FROM rentals r
+        JOIN equipment e ON r.equipment_id = e.equipment_id
+        WHERE r.is_returned = 0 AND r.actual_return_date IS NULL
+              AND r.check_in_date IS NOT NULL AND r.check_in_date != '1900-01-01'
+              AND r.expected_return_date IS NOT NULL
+        ORDER BY r.expected_return_date ASC
+    """, conn)
+
+    conn.close()
+
+    if open_rentals.empty:
+        st.info("No active rentals to monitor.")
+    else:
+        alerts = []
+        for _, row in open_rentals.iterrows():
+            exp = datetime.strptime(row["expected_return_date"], "%Y-%m-%d").date()
+            days_left = (exp - TODAY).days
+            eq_id = row["equipment_id"]
+            eq_type = row["type"]
+            op = row["operator_id"] if pd.notna(row["operator_id"]) else "—"
+            site = row["site_id"] if pd.notna(row["site_id"]) else "—"
+
+            if days_left > 5:
+                level = "ok"
+                icon = "✅"
+                color = "#22c55e"
+                tag = "On Track"
+                msg = f"Return in {days_left} days. No action needed."
+            elif 3 <= days_left <= 5:
+                level = "gentle"
+                icon = "💬"
+                color = "#3b82f6"
+                tag = "Gentle Reminder"
+                msg = f"Returning in {days_left} days. Please plan for return of {eq_type} ({eq_id}) from site {site}."
+            elif days_left == 2:
+                level = "soft_warning"
+                icon = "🔔"
+                color = "#f59e0b"
+                tag = "Soft Warning"
+                msg = f"Only 2 days left! Operator {op}, please prepare to return {eq_type} ({eq_id}) from site {site}."
+            elif days_left == 1:
+                level = "warning"
+                icon = "⚠️"
+                color = "#f97316"
+                tag = "Warning"
+                msg = f"Return TOMORROW! Operator {op} must return {eq_type} ({eq_id}) from site {site} by end of day tomorrow."
+            elif days_left == 0:
+                level = "due_today"
+                icon = "🚨"
+                color = "#ef4444"
+                tag = "Due Today"
+                msg = f"TIME TO RETURN! {eq_type} ({eq_id}) must be returned from site {site} by operator {op} TODAY."
+            else:
+                overdue_days = abs(days_left)
+                level = "overdue"
+                icon = "🔴"
+                color = "#dc2626"
+                tag = f"Overdue by {overdue_days} day{'s' if overdue_days > 1 else ''}"
+                msg = (
+                    f"OVERDUE by {overdue_days} day{'s' if overdue_days > 1 else ''}! "
+                    f"Return {eq_type} ({eq_id}) from site {site} immediately. "
+                    f"Operator {op} — escalate to supervisor."
+                )
+
+            alerts.append({
+                "equipment_id": eq_id, "type": eq_type, "operator": op,
+                "site": site, "expected_return": row["expected_return_date"],
+                "days_left": days_left, "level": level, "icon": icon,
+                "color": color, "tag": tag, "msg": msg,
+            })
+
+        # --- Summary counts ---
+        level_counts = {}
+        for a in alerts:
+            level_counts[a["level"]] = level_counts.get(a["level"], 0) + 1
+
+        summary_items = [
+            ("Overdue", level_counts.get("overdue", 0), "#dc2626"),
+            ("Due Today", level_counts.get("due_today", 0), "#ef4444"),
+            ("Warning", level_counts.get("warning", 0), "#f97316"),
+            ("Soft Warning", level_counts.get("soft_warning", 0), "#f59e0b"),
+            ("Reminder", level_counts.get("gentle", 0), "#3b82f6"),
+            ("On Track", level_counts.get("ok", 0), "#22c55e"),
+        ]
+
+        cols = st.columns(len(summary_items))
+        for col, (lbl, cnt, clr) in zip(cols, summary_items):
+            col.markdown(
+                f"""
+                <div style="
+                    background:{clr}20; border-left:4px solid {clr};
+                    padding:12px 16px; border-radius:8px; text-align:center;">
+                    <div style="font-size:28px; font-weight:700; color:{clr};">{cnt}</div>
+                    <div style="font-size:13px; color:{clr};">{lbl}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("---")
+
+        # --- Filter by severity ---
+        severity_options = ["All", "Overdue", "Due Today", "Warning", "Soft Warning", "Gentle Reminder", "On Track"]
+        level_map = {
+            "Overdue": "overdue", "Due Today": "due_today", "Warning": "warning",
+            "Soft Warning": "soft_warning", "Gentle Reminder": "gentle", "On Track": "ok",
+        }
+        sel_severity = st.selectbox("Filter by Severity", severity_options)
+
+        filtered_alerts = alerts
+        if sel_severity != "All":
+            filtered_alerts = [a for a in alerts if a["level"] == level_map[sel_severity]]
+
+        # --- Alert cards ---
+        # Sort: overdue first (most negative days_left), then ascending
+        filtered_alerts.sort(key=lambda a: a["days_left"])
+
+        for a in filtered_alerts:
+            st.markdown(
+                f"<div style='background:{a['color']}10; border-left:5px solid {a['color']}; "
+                f"padding:14px 18px; border-radius:8px; margin-bottom:8px;'>"
+                f"<div style='display:flex; justify-content:space-between; align-items:center;'>"
+                f"<div>"
+                f"<span style='font-size:18px;'>{a['icon']}</span> "
+                f"<b style='font-size:15px;'>{a['equipment_id']}</b> "
+                f"<span style='font-size:13px; color:#6b7280;'>({a['type']})</span>"
+                f"</div>"
+                f"<span style='background:{a['color']}25; color:{a['color']}; "
+                f"padding:3px 10px; border-radius:10px; font-size:12px; font-weight:600;'>"
+                f"{a['tag']}</span>"
+                f"</div>"
+                f"<div style='margin-top:6px; font-size:14px; color:#374151;'>{a['msg']}</div>"
+                f"<div style='margin-top:4px; font-size:12px; color:#9ca3af;'>"
+                f"Operator: {a['operator']} &nbsp;|&nbsp; Site: {a['site']} &nbsp;|&nbsp; "
+                f"Expected Return: {a['expected_return']}</div>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
