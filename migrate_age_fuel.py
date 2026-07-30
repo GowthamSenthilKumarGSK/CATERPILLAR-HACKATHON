@@ -4,17 +4,17 @@ import random
 conn = sqlite3.connect("equipment_rental.db")
 cursor = conn.cursor()
 
-# # Add age column to equipment table
-# try:
-#     cursor.execute("ALTER TABLE equipment ADD COLUMN age INTEGER")
-# except sqlite3.OperationalError:
-#     pass  # column already exists
+# Add age column to equipment table
+try:
+    cursor.execute("ALTER TABLE equipment ADD COLUMN age INTEGER")
+except sqlite3.OperationalError:
+    pass  # column already exists
 
-# # Assign random ages <= 10 to all equipment
-# cursor.execute("SELECT equipment_id FROM equipment")
-# for (eq_id,) in cursor.fetchall():
-#     age = random.randint(1, 10)
-#     cursor.execute("UPDATE equipment SET age = ? WHERE equipment_id = ?", (age, eq_id))
+# Assign random ages <= 10 to all equipment
+cursor.execute("SELECT equipment_id FROM equipment")
+for (eq_id,) in cursor.fetchall():
+    age = random.randint(1, 10)
+    cursor.execute("UPDATE equipment SET age = ? WHERE equipment_id = ?", (age, eq_id))
 
 # Create fuel_consumption table
 cursor.execute("DROP TABLE IF EXISTS fuel_consumption")
