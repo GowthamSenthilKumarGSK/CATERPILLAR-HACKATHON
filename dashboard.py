@@ -1729,7 +1729,6 @@ elif page == "Smart Scheduling":
         st.markdown("")
         st.dataframe(overall, use_container_width=True, hide_index=True)
 
-
 # =====================================================================
 # PAGE 8: PREDICTIVE MAINTENANCE
 # =====================================================================
@@ -1848,22 +1847,21 @@ elif page == "Predictive Maintenance":
             schedule = MAINT_SCHEDULE.get(eq_type, MAINT_SCHEDULE["Excavator"])
             adjusted_schedule = [(thresh * age_factor, name, comps, cost, days) for thresh, name, comps, cost, days in schedule]
 
-            next_service = None
-            last_service = None
+            upcoming_services = []
             for thresh, name, comps, cost, dtime in adjusted_schedule:
-                if effective_hours < thresh:
-                    next_service = {"threshold": thresh, "name": name, "components": comps, "cost": cost, "downtime": dtime}
-                    break
-                last_service = {"threshold": thresh, "name": name}
+                cycles_done = int(effective_hours // thresh)
+                next_due_at = (cycles_done + 1) * thresh
+                hrs_to_next = next_due_at - effective_hours
+                upcoming_services.append({
+                    "threshold": next_due_at, "name": name,
+                    "components": comps, "cost": cost, "downtime": dtime,
+                    "hrs_to_next": hrs_to_next, "cycle": cycles_done + 1,
+                    "interval": thresh,
+                })
+            upcoming_services.sort(key=lambda s: s["hrs_to_next"])
+            next_service = upcoming_services[0]
 
-            if next_service is None:
-                last_tier = adjusted_schedule[-1]
-                next_service = {
-                    "threshold": last_tier[0], "name": "Complete Rebuild (OVERDUE)",
-                    "components": last_tier[2], "cost": last_tier[3], "downtime": last_tier[4],
-                }
-
-            hrs_remaining = max(next_service["threshold"] - effective_hours, 0)
+            hrs_remaining = max(next_service["hrs_to_next"], 0)
 
             avg_daily_engine = total_engine_hrs / total_days if total_days > 0 else 0
             avg_daily_idle = total_idle_hrs / total_days if total_days > 0 else 0
@@ -1905,6 +1903,8 @@ elif page == "Predictive Maintenance":
                 "avg_daily_idle": round(avg_daily_idle, 1),
                 "next_service": next_service["name"],
                 "next_threshold": round(next_service["threshold"], 0),
+                "service_interval": round(next_service["interval"], 0),
+                "upcoming_services": upcoming_services,
                 "hrs_remaining": round(hrs_remaining, 1),
                 "days_until_service": days_until_service,
                 "est_cost": next_service["cost"],
