@@ -21,7 +21,7 @@ TODAY = date.today()
 
 # --- Sidebar navigation ---
 st.sidebar.title("Navigation")
-page = st.sidebar.radio("Go to", ["Dashboard", "Check In / Out", "Usage Logging", "Alerts & Reminders", "Demand Forecasting", "Anomaly Detection", "Smart Scheduling", "Predictive Maintenance", "Ask Fleet AI","Report Export"], label_visibility="collapsed")
+page = st.sidebar.radio("Go to", ["Dashboard", "Check In / Out", "Usage Logging", "Alerts & Reminders", "Demand Forecasting", "Anomaly Detection", "Smart Scheduling", "Predictive Maintenance", "Asset Utilization", "Ask Fleet AI","Report Export"], label_visibility="collapsed")
 
 
 # === Shared helpers ===
@@ -2134,9 +2134,10 @@ elif page == "Ask Fleet AI":
     st.caption("Ask questions in plain English — the AI queries your fleet data and returns instant answers")
 
     import os, re
-    SYNTH_DB = "equipment_rental_synthetic.db"
+    # SYNTH_DB = "equipment_rental_synthetic.db"
     MAIN_DB = "equipment_rental.db"
-    ai_db = SYNTH_DB if os.path.exists(SYNTH_DB) else MAIN_DB
+    # ai_db = SYNTH_DB if os.path.exists(SYNTH_DB) else MAIN_DB
+    ai_db = MAIN_DB
     conn_ai = sqlite3.connect(ai_db)
 
     @st.cache_data(ttl=120)
@@ -2661,6 +2662,277 @@ elif page == "Ask Fleet AI":
         st.markdown(f"**Question:** *{active_query}*")
         st.markdown("")
         process_query(active_query)
+
+
+elif page == "Asset Utilization":
+    st.markdown(
+        "<h1 style='text-align:center;'>Asset Utilization</h1>",
+        unsafe_allow_html=True,
+    )
+    st.caption("Flags underutilized assets using IDLE TIME as the primary signal — high idle means paid/deployed equipment that isn't earning its keep. "
+               "Idle % = idle hrs ÷ total hrs. Healthy < 25% · Watch 25–40% · Severe > 40%. Only idle beyond a 15% 'unavoidable' floor counts as wasted rent.")
+
+    import os
+    SYNTH_DB = "equipment_rental_synthetic.db"
+    MAIN_DB = "equipment_rental.db"
+    util_db = SYNTH_DB if os.path.exists(SYNTH_DB) else MAIN_DB
+    conn = sqlite3.connect(util_db)
+
+    util_raw = pd.read_sql_query("""
+        SELECT r.equipment_id, e.type, e.age, e.status, e.daily_rental_rate,
+               r.site_id, r.operator_id, r.rental_days, r.is_returned,
+               r.engine_hours_per_day, r.idle_hours_per_day, r.check_in_date
+        FROM rentals r
+        JOIN equipment e ON r.equipment_id = e.equipment_id
+        WHERE r.operator_id IS NOT NULL
+          AND r.check_in_date IS NOT NULL AND r.check_in_date != '1900-01-01'
+          AND r.is_returned = 1
+    """, conn)
+    all_equipment = pd.read_sql_query("SELECT * FROM equipment", conn)
+    conn.close()
+
+    if util_raw.empty:
+        st.warning("No completed rental data available to analyze utilization.")
+    else:
+        # ---- Idle-driven thresholds ----
+        # Some idle is unavoidable (warm-up, repositioning, operator breaks),
+        # so only idle ABOVE this floor is treated as wasted.
+        ACCEPTABLE_IDLE = 0.15   # 15% idle is considered normal
+        SEVERE_IDLE = 0.40       # > 40% idle  -> severely underutilized
+        WATCH_IDLE = 0.25        # 25-40% idle -> watch
+
+        # ---- Per-asset aggregation (weighted by rental days) ----
+        rows = []
+        for eq_id, d in util_raw.groupby("equipment_id"):
+            total_engine = (d["engine_hours_per_day"] * d["rental_days"]).sum()
+            total_idle = (d["idle_hours_per_day"] * d["rental_days"]).sum()
+            total_days = d["rental_days"].sum()
+            total_hours = total_engine + total_idle
+            if total_days <= 0 or total_hours <= 0:
+                continue
+
+            idle_ratio = total_idle / total_hours
+            avg_idle_day = total_idle / total_days
+            avg_engine_day = total_engine / total_days
+            daily_rate = d["daily_rental_rate"].iloc[0]
+
+            # Wasted rent = only the EXCESS idle beyond the acceptable floor,
+            # so normally-productive assets don't inflate the number.
+            excess_idle = max(idle_ratio - ACCEPTABLE_IDLE, 0)
+            wasted_rent = excess_idle * total_days * daily_rate
+
+            if idle_ratio > SEVERE_IDLE:
+                flag, flag_color, action = "Severely Underutilized", "#dc2626", "Off-hire or redeploy to a higher-demand site"
+            elif idle_ratio >= WATCH_IDLE:
+                flag, flag_color, action = "Watch", "#f59e0b", "Investigate site workflow / scheduling"
+            else:
+                flag, flag_color, action = "Healthy", "#22c55e", "Productive — no action needed"
+
+            rows.append({
+                "equipment_id": eq_id,
+                "type": d["type"].iloc[0],
+                "age": d["age"].iloc[0],
+                "primary_site": d["site_id"].mode().iloc[0] if not d["site_id"].mode().empty else "-",
+                "idle_ratio": round(idle_ratio * 100, 1),
+                "avg_idle_day": round(avg_idle_day, 1),
+                "avg_engine_day": round(avg_engine_day, 1),
+                "total_idle_hrs": round(total_idle, 0),
+                "total_engine_hrs": round(total_engine, 0),
+                "total_days": int(total_days),
+                "daily_rate": daily_rate,
+                "wasted_rent": round(wasted_rent, 0),
+                "flag": flag,
+                "flag_color": flag_color,
+                "action": action,
+            })
+
+        util_df = pd.DataFrame(rows)
+
+        # Type-relative baseline: a crane idles more than an excavator by nature.
+        type_median = util_df.groupby("type")["idle_ratio"].median().to_dict()
+        util_df["type_median_idle"] = util_df["type"].map(type_median).round(1)
+        util_df["vs_type"] = (util_df["idle_ratio"] - util_df["type_median_idle"]).round(1)
+
+        severe = util_df[util_df["flag"] == "Severely Underutilized"]
+        watch = util_df[util_df["flag"] == "Watch"]
+        healthy = util_df[util_df["flag"] == "Healthy"]
+
+        # =============================================================
+        # SECTION 1: FLEET UTILIZATION SUMMARY
+        # =============================================================
+        total_wasted = severe["wasted_rent"].sum() + watch["wasted_rent"].sum()
+        total_idle_hrs = util_df["total_idle_hrs"].sum()
+
+        s1, s2, s3, s4, s5 = st.columns(5)
+        cards = [
+            (s1, "Assets Analyzed", f"{len(util_df)}", "#3b82f6"),
+            (s2, "Severely Underutilized", f"{len(severe)}", "#dc2626"),
+            (s3, "Watch", f"{len(watch)}", "#f59e0b"),
+            (s4, "Healthy", f"{len(healthy)}", "#22c55e"),
+            (s5, "Rent Lost to Idle", f"${total_wasted:,.0f}", "#dc2626"),
+        ]
+        for col, lbl, val, clr in cards:
+            col.markdown(
+                f"<div style='background:{clr}18; border-left:4px solid {clr}; padding:12px 14px; border-radius:8px; text-align:center;'>"
+                f"<div style='font-size:26px; font-weight:700; color:{clr};'>{val}</div>"
+                f"<div style='font-size:12px; color:{clr};'>{lbl}</div></div>",
+                unsafe_allow_html=True,
+            )
+
+        # =============================================================
+        # SECTION 2: INSIGHTS PER TIER (the 3 scenarios)
+        # =============================================================
+        st.markdown("---")
+        st.subheader("Utilization Insights")
+
+        # -- Severely Underutilized --
+        sev_waste = severe["wasted_rent"].sum()
+        worst_line = ""
+        if not severe.empty:
+            worst = severe.sort_values("idle_ratio", ascending=False).iloc[0]
+            worst_line = f"Worst offender: <b>{worst['equipment_id']}</b> ({worst['type']}) at <b>{worst['idle_ratio']}% idle</b> — mostly parked while on rent."
+        st.markdown(
+            f"<div style='background:#dc262610; border-left:5px solid #dc2626; padding:14px 18px; border-radius:8px; margin-bottom:10px;'>"
+            f"<div style='color:#dc2626; font-weight:700; font-size:15px;'>Severely Underutilized — {len(severe)} assets (&gt;40% idle)</div>"
+            f"<div style='margin-top:6px; font-size:14px; color:#374151;'>"
+            f"These machines spend <b>more time idle than working</b>. Approximately <b>${sev_waste:,.0f}</b> of rental spend was effectively burned on idle time. "
+            f"{worst_line}</div>"
+            f"<div style='margin-top:6px; font-size:13px; color:#991b1b;'><b>Action:</b> Off-hire immediately or redeploy to a site with real demand.</div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+        # -- Watch --
+        watch_waste = watch["wasted_rent"].sum()
+        st.markdown(
+            f"<div style='background:#f59e0b10; border-left:5px solid #f59e0b; padding:14px 18px; border-radius:8px; margin-bottom:10px;'>"
+            f"<div style='color:#f59e0b; font-weight:700; font-size:15px;'>Watch — {len(watch)} assets (25–40% idle)</div>"
+            f"<div style='margin-top:6px; font-size:14px; color:#374151;'>"
+            f"Elevated idle, ~<b>${watch_waste:,.0f}</b> at stake. This is often a <b>site-workflow problem</b> (poor sequencing, waiting on other trades) rather than the asset itself — "
+            f"check whether the same site keeps appearing below.</div>"
+            f"<div style='margin-top:6px; font-size:13px; color:#92400e;'><b>Action:</b> Review site scheduling before deciding to move the machine.</div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+        # -- Healthy --
+        med_healthy = healthy["idle_ratio"].median() if not healthy.empty else 0
+        st.markdown(
+            f"<div style='background:#22c55e10; border-left:5px solid #22c55e; padding:14px 18px; border-radius:8px; margin-bottom:10px;'>"
+            f"<div style='color:#16a34a; font-weight:700; font-size:15px;'>Healthy — {len(healthy)} assets (&lt;25% idle)</div>"
+            f"<div style='margin-top:6px; font-size:14px; color:#374151;'>"
+            f"Productive assets earning their keep (median idle ~<b>{med_healthy:.0f}%</b>). Use these as the <b>benchmark</b> — their sites and operators are running efficiently.</div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+        # =============================================================
+        # SECTION 3: FLAGGED ASSETS (ranked worst-first)
+        # =============================================================
+        st.markdown("---")
+        st.subheader("Flagged Assets")
+
+        fc1, fc2 = st.columns(2)
+        with fc1:
+            tier_filter = st.selectbox("Filter by Flag", ["All", "Severely Underutilized", "Watch", "Healthy"], key="util_flag")
+        with fc2:
+            type_filter_u = st.selectbox("Filter by Equipment Type", ["All"] + sorted(util_df["type"].unique().tolist()), key="util_type")
+
+        flagged = util_df.sort_values("idle_ratio", ascending=False).copy()
+        if tier_filter != "All":
+            flagged = flagged[flagged["flag"] == tier_filter]
+        if type_filter_u != "All":
+            flagged = flagged[flagged["type"] == type_filter_u]
+
+        show = flagged[[
+            "equipment_id", "type", "primary_site", "idle_ratio", "type_median_idle", "vs_type",
+            "avg_idle_day", "avg_engine_day", "total_days", "wasted_rent", "flag", "action",
+        ]].copy()
+        show.columns = [
+            "Equipment", "Type", "Main Site", "Idle %", "Type Med %", "vs Type",
+            "Idle hrs/day", "Engine hrs/day", "Rental Days", "Rent Lost ($)", "Flag", "Recommended Action",
+        ]
+        st.dataframe(show, use_container_width=True, hide_index=True)
+        st.caption("'vs Type' = how far this asset's idle sits above (+) or below (−) the median for its equipment type. A crane idling more than an excavator is normal; a positive 'vs Type' is the real outlier.")
+
+        # =============================================================
+        # SECTION 4: IDLE COST IMPACT
+        # =============================================================
+        st.markdown("---")
+        st.subheader("Idle Cost Impact")
+
+        flagged_assets = util_df[util_df["flag"] != "Healthy"]
+        waste_by_type = flagged_assets.groupby("type")["wasted_rent"].sum().reset_index()
+        waste_by_type.columns = ["Equipment Type", "Rent Lost to Idle ($)"]
+        waste_by_type = waste_by_type.sort_values("Rent Lost to Idle ($)", ascending=False)
+
+        ci1, ci2 = st.columns(2)
+        with ci1:
+            st.markdown("**Rent Lost to Idle — by Equipment Type** (flagged assets)")
+            st.bar_chart(waste_by_type.set_index("Equipment Type"), use_container_width=True)
+        with ci2:
+            st.markdown("**Average Idle % — by Equipment Type**")
+            idle_by_type = util_df.groupby("type")["idle_ratio"].mean().round(1).reset_index()
+            idle_by_type.columns = ["Equipment Type", "Avg Idle %"]
+            st.bar_chart(idle_by_type.set_index("Equipment Type"), use_container_width=True)
+
+        # =============================================================
+        # SECTION 5: SITE-LEVEL INSIGHT (workflow bottleneck detection)
+        # =============================================================
+        st.markdown("---")
+        st.subheader("Site Workflow Check")
+        st.caption("If a site drives high idle across many assets, the problem is the site — not the machines")
+
+        site_stats = util_df.groupby("primary_site").agg(
+            assets=("equipment_id", "count"),
+            avg_idle=("idle_ratio", "mean"),
+            rent_lost=("wasted_rent", "sum"),
+        ).reset_index()
+        site_stats["avg_idle"] = site_stats["avg_idle"].round(1)
+        site_stats = site_stats[site_stats["assets"] >= 2].sort_values("avg_idle", ascending=False)
+
+        if not site_stats.empty:
+            worst_site = site_stats.iloc[0]
+            if worst_site["avg_idle"] > WATCH_IDLE * 100:
+                st.markdown(
+                    f"<div style='background:#f59e0b10; border-left:5px solid #f59e0b; padding:12px 16px; border-radius:8px; margin-bottom:10px;'>"
+                    f"<b>{worst_site['primary_site']}</b> runs the highest average idle "
+                    f"(<b>{worst_site['avg_idle']:.0f}%</b> across {int(worst_site['assets'])} assets, ${worst_site['rent_lost']:,.0f} lost). "
+                    f"Likely a scheduling / job-sequencing bottleneck at this site.</div>",
+                    unsafe_allow_html=True,
+                )
+            site_disp = site_stats.copy()
+            site_disp["rent_lost"] = site_disp["rent_lost"].round(0)
+            site_disp.columns = ["Site", "Assets", "Avg Idle %", "Rent Lost ($)"]
+            st.dataframe(site_disp, use_container_width=True, hide_index=True)
+        else:
+            st.info("Not enough multi-asset sites to assess site-level workflow.")
+
+        # =============================================================
+        # SECTION 6: OWNED BUT UNRENTED (zero-revenue assets)
+        # =============================================================
+        st.markdown("---")
+        st.subheader("Idle in the Yard — Owned but Unrented")
+        st.caption("Assets sitting 'available' generate zero revenue — a different kind of underutilization")
+
+        rented_ids = set(util_raw["equipment_id"].unique())
+        available = all_equipment[all_equipment["status"] == "available"].copy()
+
+        if not available.empty:
+            available["potential_daily_revenue"] = available["daily_rental_rate"]
+            never_rented = available[~available["equipment_id"].isin(rented_ids)]
+
+            oc1, oc2, oc3 = st.columns(3)
+            oc1.metric("Available (idle in yard)", len(available))
+            oc2.metric("Never Rented", len(never_rented))
+            oc3.metric("Potential Daily Revenue Sitting Idle", f"${available['daily_rental_rate'].sum():,.0f}/day")
+
+            avail_disp = available[["equipment_id", "type", "age", "daily_rental_rate"]].copy()
+            avail_disp.columns = ["Equipment", "Type", "Age (yrs)", "Daily Rate ($)"]
+            avail_disp = avail_disp.sort_values("Daily Rate ($)", ascending=False)
+            st.dataframe(avail_disp, use_container_width=True, hide_index=True)
+        else:
+            st.success("No idle-in-yard assets — the entire fleet is deployed.")
 
 
 elif page == "Report Export":
