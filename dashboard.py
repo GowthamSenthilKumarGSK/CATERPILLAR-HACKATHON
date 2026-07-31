@@ -1962,9 +1962,29 @@ elif page == "Predictive Maintenance":
         for _, eq in display_maint.iterrows():
             clr = eq["risk_color"]
 
-            progress_pct = max(0, min(100, 100 - (eq["hrs_remaining"] / eq["next_threshold"] * 100))) if eq["next_threshold"] > 0 else 100
-
             comp_list = " &nbsp;|&nbsp; ".join(eq["components"][:4])
+
+            tier_order = ["Basic Service", "Intermediate Service", "Major Service", "Engine Overhaul", "Complete Rebuild"]
+            tier_colors = {"Basic Service": "#22c55e", "Intermediate Service": "#3b82f6",
+                           "Major Service": "#f59e0b", "Engine Overhaul": "#ef4444", "Complete Rebuild": "#dc2626"}
+            svc_by_name = {s["name"]: s for s in eq["upcoming_services"]}
+            svc_rows = ""
+            for tier_name in tier_order:
+                svc = svc_by_name.get(tier_name)
+                if svc is None:
+                    continue
+                svc_clr = tier_colors.get(tier_name, "#6b7280")
+                svc_pct = max(0, min(100, 100 - (svc["hrs_to_next"] / svc["interval"] * 100))) if svc["interval"] > 0 else 0
+                svc_rows += (
+                    f"<div style='display:flex; align-items:center; gap:8px; margin-top:4px; font-size:13px;'>"
+                    f"<span style='min-width:155px; color:{svc_clr}; font-weight:600;'>{svc['name']}</span>"
+                    f"<div style='flex:1; background:#e5e7eb; border-radius:4px; height:6px; overflow:hidden;'>"
+                    f"<div style='background:{svc_clr}; width:{svc_pct:.0f}%; height:100%;'></div></div>"
+                    f"<span style='min-width:90px; text-align:right; color:#6b7280;'>{svc['hrs_to_next']:.0f} hrs left</span>"
+                    f"<span style='min-width:70px; text-align:right; color:#9ca3af;'>${svc['cost']:,}</span>"
+                    f"<span style='min-width:55px; text-align:right; color:#9ca3af;'>{svc['downtime']}d</span>"
+                    f"</div>"
+                )
 
             st.markdown(
                 f"<div style='background:{clr}08; border-left:5px solid {clr}; padding:16px 20px; border-radius:8px; margin-bottom:10px;'>"
@@ -1982,15 +2002,18 @@ elif page == "Predictive Maintenance":
                 f"<div><b>Est. Cost:</b> ${eq['est_cost']:,}</div>"
                 f"<div><b>Downtime:</b> {eq['downtime_days']} day{'s' if eq['downtime_days'] > 1 else ''}</div>"
                 f"</div>"
-                f"<div style='margin-top:8px; background:#e5e7eb; border-radius:6px; height:8px; overflow:hidden;'>"
-                f"<div style='background:{clr}; width:{progress_pct:.0f}%; height:100%; border-radius:6px;'></div>"
+                f"<div style='margin-top:10px; font-size:12px; color:#6b7280;'><b>All Service Tiers:</b></div>"
+                f"<div style='display:flex; align-items:center; gap:8px; margin-top:4px; font-size:11px; color:#9ca3af;'>"
+                f"<span style='min-width:155px;'>Service</span>"
+                f"<span style='flex:1; text-align:center;'>Wear Progress</span>"
+                f"<span style='min-width:90px; text-align:right;'>Hrs Left</span>"
+                f"<span style='min-width:70px; text-align:right;'>Cost</span>"
+                f"<span style='min-width:55px; text-align:right;'>Downtime</span>"
                 f"</div>"
-                f"<div style='display:flex; justify-content:space-between; font-size:11px; color:#9ca3af; margin-top:2px;'>"
-                f"<span>Effective: {eq['effective_hrs']} hrs</span>"
-                f"<span>Next at: {eq['next_threshold']:.0f} hrs ({progress_pct:.0f}% worn)</span>"
-                f"</div>"
-                f"<div style='margin-top:8px; font-size:12px; color:#6b7280;'>"
-                f"<b>Components:</b> {comp_list}"
+                f"{svc_rows}"
+                f"<div style='display:flex; justify-content:space-between; font-size:11px; color:#9ca3af; margin-top:6px;'>"
+                f"<span>Effective hours: {eq['effective_hrs']}</span>"
+                f"<span>Components: {comp_list}</span>"
                 f"</div>"
                 f"</div>",
                 unsafe_allow_html=True,

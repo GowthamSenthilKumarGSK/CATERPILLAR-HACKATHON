@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Smart Rental Tracking System — Caterpillar</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Space+Grotesk:wght@500;600;700&display=swap');
+
+  :root{
+    --cat-yellow:#FFCD11;
+    --cat-yellow-dk:#E5B800;
+    --ink:#141518;
+    --sub:#5b5f66;
+    --muted:#82868f;
+    --bg:#f5f6f8;
+    --panel:#ffffff;
+    --line:#e6e8ec;
+    --line-2:#d7dae0;
+    --green:#16a34a;
+    --blue:#2563eb;
+    --red:#dc2626;
+    --amber:#d97706;
+    --purple:#9333ea;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{height:100%}
+  body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--ink);overflow:hidden}
+
+  .deck{position:relative;width:100vw;height:100vh}
+  .slide{
+    position:absolute;inset:0;display:none;flex-direction:column;
+    padding:8vh 8vw 6vh;opacity:0;transition:opacity .45s ease;
+    background:
+      radial-gradient(1100px 520px at 88% -12%, rgba(255,205,17,.18), transparent 60%),
+      radial-gradient(760px 420px at -5% 112%, rgba(255,205,17,.10), transparent 58%),
+      var(--bg);
+  }
+  .slide.active{display:flex;opacity:1;animation:rise .55s ease}
+  @keyframes rise{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:translateY(0)}}
+
+  .kicker{font-family:'Space Grotesk';letter-spacing:.26em;text-transform:uppercase;font-size:.76rem;font-weight:600;color:var(--cat-yellow-dk);display:flex;align-items:center;gap:.7rem;margin-bottom:1.1rem}
+  .kicker::before{content:"";width:32px;height:3px;background:var(--cat-yellow);border-radius:2px}
+
+  h1{font-family:'Space Grotesk';font-weight:700;font-size:clamp(2.3rem,5.4vw,4.4rem);line-height:1.02;letter-spacing:-.02em}
+  h2{font-family:'Space Grotesk';font-weight:700;font-size:clamp(1.8rem,3.6vw,2.9rem);line-height:1.05;letter-spacing:-.02em}
+  .accent{color:var(--cat-yellow-dk)}
+  .sub{color:var(--sub);font-size:clamp(1rem,1.4vw,1.2rem);font-weight:400;max-width:62ch}
+
+  .rail{position:fixed;top:0;left:0;right:0;height:56px;display:flex;align-items:center;justify-content:space-between;padding:0 8vw;z-index:20;pointer-events:none}
+  .brand{display:flex;align-items:center;gap:.6rem;font-family:'Space Grotesk';font-weight:700;font-size:.86rem;letter-spacing:.02em;color:var(--ink)}
+  .brand .tri{width:0;height:0;border-left:9px solid transparent;border-right:9px solid transparent;border-bottom:15px solid var(--cat-yellow-dk)}
+  .rail .idx{font-family:'Space Grotesk';font-size:.8rem;color:var(--muted);font-variant-numeric:tabular-nums}
+
+  .prog{position:fixed;bottom:0;left:0;height:4px;background:var(--cat-yellow);width:0;z-index:30;transition:width .4s ease}
+  .dots{position:fixed;right:2.2vw;top:50%;transform:translateY(-50%);display:flex;flex-direction:column;gap:.55rem;z-index:25}
+  .dot{width:9px;height:9px;border-radius:50%;background:var(--line-2);cursor:pointer;transition:.25s}
+  .dot.on{background:var(--cat-yellow-dk);transform:scale(1.35)}
+  .hint{position:fixed;bottom:14px;left:8vw;font-size:.72rem;color:var(--muted);z-index:25}
+  kbd{background:var(--panel);border:1px solid var(--line-2);border-radius:5px;padding:1px 7px;font-family:'Space Grotesk';font-size:.7rem;color:var(--ink)}
+
+  .grid{display:grid;gap:1rem;margin-top:2rem}
+  .g2{grid-template-columns:repeat(2,1fr)}
+  .g3{grid-template-columns:repeat(3,1fr)}
+  .g4{grid-template-columns:repeat(4,1fr)}
+  .g5{grid-template-columns:repeat(5,1fr)}
+  .split{display:grid;grid-template-columns:1fr 1fr;gap:3rem;align-items:center;margin-top:1.4rem;flex:1}
+
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:15px;padding:1.25rem 1.2rem;position:relative;overflow:hidden;transition:.28s;box-shadow:0 1px 2px rgba(20,21,24,.04)}
+  .card::after{content:"";position:absolute;top:0;left:0;width:100%;height:3px;background:transparent;transition:.28s}
+  .card:hover{border-color:var(--line-2);transform:translateY(-3px);box-shadow:0 14px 30px -14px rgba(20,21,24,.18)}
+  .card:hover::after{background:var(--cat-yellow)}
+  .card .ic{font-size:1.55rem;display:block;margin-bottom:.6rem}
+  .card h3{font-family:'Space Grotesk';font-size:.98rem;font-weight:600;margin-bottom:.3rem}
+  .card p{font-size:.8rem;color:var(--muted);line-height:1.4}
+
+  .stat .num{font-family:'Space Grotesk';font-weight:700;font-size:clamp(1.9rem,3.8vw,2.9rem);color:var(--cat-yellow-dk);line-height:1;letter-spacing:-.02em}
+  .stat .lbl{font-size:.78rem;color:var(--muted);margin-top:.45rem}
+
+  .pill{display:inline-flex;align-items:center;gap:.45rem;background:var(--panel);border:1px solid var(--line-2);border-radius:999px;padding:.4rem .85rem;font-size:.8rem;font-weight:500;color:var(--ink)}
+  .pillrow{display:flex;flex-wrap:wrap;gap:.55rem;margin-top:1.5rem}
+  .d{width:8px;height:8px;border-radius:50%}
+
+  /* chips list for page sections */
+  .chips{display:flex;flex-direction:column;gap:.7rem;margin-top:.4rem}
+  .chip{display:flex;align-items:center;gap:.8rem;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:.75rem .95rem;font-size:.92rem;font-weight:500;transition:.25s}
+  .chip:hover{border-color:var(--cat-yellow);transform:translateX(4px)}
+  .chip .n{font-family:'Space Grotesk';font-size:.78rem;font-weight:700;color:var(--cat-yellow-dk);width:22px}
+  .chip .em{font-size:1.15rem}
+  .chip small{color:var(--muted);font-weight:400;font-size:.8rem}
+
+  .flow{display:flex;align-items:stretch;gap:0;margin-top:2rem;flex-wrap:wrap}
+  .step{flex:1;min-width:150px;background:var(--panel);border:1px solid var(--line);border-radius:13px;padding:1.05rem;box-shadow:0 1px 2px rgba(20,21,24,.04)}
+  .step .n{font-family:'Space Grotesk';font-size:.7rem;color:var(--cat-yellow-dk);font-weight:700;letter-spacing:.1em}
+  .step h4{font-family:'Space Grotesk';font-size:.96rem;margin:.35rem 0 .3rem}
+  .step p{font-size:.76rem;color:var(--muted);line-height:1.35}
+  .arrow{display:flex;align-items:center;color:var(--cat-yellow-dk);font-size:1.4rem;padding:0 .3rem}
+
+  .center{align-items:center;justify-content:center;text-align:center}
+  .titlewrap{max-width:72ch}
+  .machine{font-size:clamp(3rem,9vw,6.5rem);filter:drop-shadow(0 10px 22px rgba(229,184,0,.35))}
+</style>
+</head>
+<body>
+
+<div class="rail">
+  <div class="brand"><span class="tri"></span> CATERPILLAR · SMART RENTAL SYSTEM</div>
+  <div class="idx"><span id="cur">01</span> / <span id="tot">13</span></div>
+</div>
+
+<div class="deck" id="deck">
+
+  <!-- 1 · TITLE -->
+  <section class="slide center">
+    <div class="titlewrap">
+      <div class="machine">🚜</div>
+      <div class="kicker" style="justify-content:center">Hackathon Project</div>
+      <h1>Smart Rental <span class="accent">Tracking System</span></h1>
+      <p class="sub" style="margin:1.3rem auto 0">A single dashboard to track, forecast and maintain Caterpillar's rental fleet.</p>
+      <div class="pillrow" style="justify-content:center">
+        <span class="pill">🐍 Python</span>
+        <span class="pill">⚡ Streamlit</span>
+        <span class="pill">🗄️ SQLite</span>
+        <span class="pill">🤖 LightGBM · ARIMA</span>
+        <span class="pill">🔍 IsolationForest</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- 2 · NAVIGATION OVERVIEW -->
+  <section class="slide">
+    <div class="kicker">Dashboard Navigation</div>
+    <h2>Ten <span class="accent">pages</span>, one app</h2>
+    <div class="grid g5" style="margin-top:1.8rem">
+      <div class="card"><span class="ic">📊</span><h3>Dashboard</h3></div>
+      <div class="card"><span class="ic">🔄</span><h3>Check In / Out</h3></div>
+      <div class="card"><span class="ic">⏱️</span><h3>Usage Logging</h3></div>
+      <div class="card"><span class="ic">🔔</span><h3>Alerts & Reminders</h3></div>
+      <div class="card"><span class="ic">📈</span><h3>Demand Forecasting</h3></div>
+      <div class="card"><span class="ic">🔍</span><h3>Anomaly Detection</h3></div>
+      <div class="card"><span class="ic">🧭</span><h3>Smart Scheduling</h3></div>
+      <div class="card"><span class="ic">🛠️</span><h3>Predictive Maintenance</h3></div>
+      <div class="card"><span class="ic">💬</span><h3>Ask Fleet AI</h3></div>
+      <div class="card"><span class="ic">📄</span><h3>Report Export</h3></div>
+    </div>
+  </section>
+
+  <!-- 3 · DASHBOARD -->
+  <section class="slide">
+    <div class="kicker">Page · Dashboard</div>
+    <div class="split">
+      <div>
+        <h2>Live fleet <span class="accent">status</span></h2>
+        <p class="sub" style="margin-top:.9rem">Filter by equipment type & site ID. Every asset color-coded by status.</p>
+        <div class="pillrow">
+          <span class="pill"><span class="d" style="background:var(--green)"></span> Available</span>
+          <span class="pill"><span class="d" style="background:var(--blue)"></span> Active Rental</span>
+          <span class="pill"><span class="d" style="background:var(--red)"></span> Overdue</span>
+          <span class="pill"><span class="d" style="background:var(--amber)"></span> Data Error</span>
+          <span class="pill"><span class="d" style="background:var(--purple)"></span> Suspicious</span>
+        </div>
+      </div>
+      <div class="chips">
+        <div class="chip"><span class="em">🔎</span> Filter by Equipment Type & Site ID</div>
+        <div class="chip"><span class="em">🟩</span> Status summary cards</div>
+        <div class="chip"><span class="em">📋</span> Per-equipment status list</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 4 · CHECK IN/OUT -->
+  <section class="slide">
+    <div class="kicker">Page · Check In / Out</div>
+    <div class="split">
+      <div>
+        <h2>One-tap <span class="accent">rental flow</span></h2>
+        <p class="sub" style="margin-top:.9rem">Check equipment in and out with auto-calculated rental days.</p>
+      </div>
+      <div class="chips">
+        <div class="chip"><span class="n">IN</span> Select equipment, operator & site <small>· est. rental days</small></div>
+        <div class="chip"><span class="n">OUT</span> Log engine & idle hours / day <small>· rental days</small></div>
+        <div class="chip"><span class="em">✅</span> Instant status update to fleet</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 5 · USAGE LOGGING -->
+  <section class="slide">
+    <div class="kicker">Page · Usage Logging</div>
+    <h2>Track how machines <span class="accent">actually run</span></h2>
+    <div class="grid g4">
+      <div class="card"><span class="ic">🏗️</span><h3>Usage Per Site</h3><p>Activity by location.</p></div>
+      <div class="card"><span class="ic">📋</span><h3>Detailed Usage Log</h3><p>Every rental record.</p></div>
+      <div class="card"><span class="ic">⏸️</span><h3>Downtime Analysis</h3><p>Idle vs engine hours.</p></div>
+      <div class="card"><span class="ic">⛽</span><h3>Fuel Consumption</h3><p>Per equipment.</p></div>
+    </div>
+  </section>
+
+  <!-- 6 · ALERTS -->
+  <section class="slide">
+    <div class="kicker">Page · Alerts & Reminders</div>
+    <div class="split">
+      <div>
+        <h2>Never miss a <span class="accent">return</span></h2>
+        <p class="sub" style="margin-top:.9rem">Overdue rentals surfaced as severity-ranked alert cards.</p>
+      </div>
+      <div class="chips">
+        <div class="chip"><span class="em">🔴</span> Overdue rental detection</div>
+        <div class="chip"><span class="em">🎚️</span> Filter by severity</div>
+        <div class="chip"><span class="em">🗂️</span> Alert cards with details</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 7 · DEMAND FORECASTING -->
+  <section class="slide">
+    <div class="kicker">Page · Demand Forecasting</div>
+    <div class="split">
+      <div>
+        <h2>Predict demand <span class="accent">8 weeks out</span></h2>
+        <p class="sub" style="margin-top:.9rem">Weekly working-hours demand from saved <b>LightGBM</b> & <b>ARIMA</b> models.</p>
+        <div class="grid g3" style="margin-top:1.4rem">
+          <div class="stat"><div class="num">2</div><div class="lbl">ML models</div></div>
+          <div class="stat"><div class="num">8w</div><div class="lbl">Horizon</div></div>
+          <div class="stat"><div class="num">4×</div><div class="lbl">Walk-forward folds</div></div>
+        </div>
+      </div>
+      <div class="chips">
+        <div class="chip"><span class="em">📊</span> Historical working-hours demand</div>
+        <div class="chip"><span class="em">🏷️</span> Demand by equipment type</div>
+        <div class="chip"><span class="em">📍</span> Demand by site</div>
+        <div class="chip"><span class="em">🤖</span> Forecasts — LightGBM & ARIMA</div>
+        <div class="chip"><span class="em">🌤️</span> Seasonal demand patterns</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 8 · ANOMALY -->
+  <section class="slide">
+    <div class="kicker">Page · Anomaly Detection</div>
+    <div class="split">
+      <div>
+        <h2>Catch the <span class="accent">outliers</span></h2>
+        <p class="sub" style="margin-top:.9rem">An unsupervised <b>IsolationForest</b> flags abnormal machines — no labels needed.</p>
+      </div>
+      <div class="chips">
+        <div class="chip"><span class="em">⚙️</span> Engine vs idle hours</div>
+        <div class="chip"><span class="em">⛽</span> Fuel per hour</div>
+        <div class="chip"><span class="em">📅</span> Rental duration</div>
+        <div class="chip"><span class="em">🚩</span> Flagged as Suspicious on the fleet</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 9 · SMART SCHEDULING -->
+  <section class="slide">
+    <div class="kicker">Page · Smart Scheduling</div>
+    <div class="split">
+      <div>
+        <h2>Right operator, <span class="accent">right machine</span></h2>
+        <p class="sub" style="margin-top:.9rem">Operators scored on rentals, days, utilization & on-time returns.</p>
+      </div>
+      <div class="chips">
+        <div class="chip"><span class="em">🎯</span> Get AI Recommendation</div>
+        <div class="chip"><span class="em">🏆</span> Top operators — overall performance</div>
+        <div class="chip"><span class="em">📐</span> Score = rentals + days + utilization + on-time</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 10 · PREDICTIVE MAINTENANCE -->
+  <section class="slide">
+    <div class="kicker">Page · Predictive Maintenance</div>
+    <h2>Service <span class="accent">before</span> breakdown</h2>
+    <div class="grid g5">
+      <div class="card"><span class="ic">🔔</span><h3>Maintenance Alerts</h3></div>
+      <div class="card"><span class="ic">🔥</span><h3>Idle Wear & Emissions</h3></div>
+      <div class="card"><span class="ic">🗓️</span><h3>Maintenance Timeline</h3></div>
+      <div class="card"><span class="ic">💰</span><h3>Cost Projection</h3></div>
+      <div class="card"><span class="ic">📖</span><h3>Schedule Reference</h3></div>
+    </div>
+    <div class="pillrow">
+      <span class="pill"><span class="d" style="background:#dc2626"></span> Critical</span>
+      <span class="pill"><span class="d" style="background:var(--red)"></span> High</span>
+      <span class="pill"><span class="d" style="background:var(--amber)"></span> Warning</span>
+      <span class="pill"><span class="d" style="background:var(--blue)"></span> Monitor</span>
+      <span class="pill"><span class="d" style="background:var(--green)"></span> Good</span>
+    </div>
+  </section>
+
+  <!-- 11 · ASK FLEET AI -->
+  <section class="slide">
+    <div class="kicker">Page · Ask Fleet AI</div>
+    <div class="split">
+      <div>
+        <h2>Just <span class="accent">ask.</span></h2>
+        <p class="sub" style="margin-top:.9rem">Type a question — it parses intent, time range, equipment type & site.</p>
+        <div class="pillrow">
+          <span class="pill">🏗️ Excavator</span>
+          <span class="pill">🏗️ Crane</span>
+          <span class="pill">🚜 Bulldozer</span>
+          <span class="pill">🛣️ Grader</span>
+        </div>
+      </div>
+      <div class="chips">
+        <div class="chip"><span class="em">💤</span> Under / over-utilized</div>
+        <div class="chip"><span class="em">⏰</span> Overdue & available</div>
+        <div class="chip"><span class="em">💵</span> Revenue & maintenance</div>
+        <div class="chip"><span class="em">👷</span> Operator & site insights</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 12 · REPORT EXPORT -->
+  <section class="slide">
+    <div class="kicker">Page · Report Export</div>
+    <div class="split">
+      <div>
+        <h2>One-click <span class="accent">executive PDF</span></h2>
+        <p class="sub" style="margin-top:.9rem">Fleet Health & Anomaly Executive Report, branded for Caterpillar operations.</p>
+      </div>
+      <div class="chips">
+        <div class="chip"><span class="em">📄</span> Branded PDF header & footer</div>
+        <div class="chip"><span class="em">🩺</span> Fleet health summary</div>
+        <div class="chip"><span class="em">🚩</span> Anomaly & maintenance section</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 13 · CLOSE -->
+  <section class="slide center">
+    <div class="titlewrap">
+      <div class="kicker" style="justify-content:center">The Impact</div>
+      <h2>From <span class="accent">reactive</span> to <span class="accent">predictive</span></h2>
+      <div class="grid g4" style="margin-top:2.2rem;text-align:left">
+        <div class="card stat"><div class="num">10</div><div class="lbl">Pages / modules</div></div>
+        <div class="card stat"><div class="num">3</div><div class="lbl">ML techniques</div></div>
+        <div class="card stat"><div class="num">8w</div><div class="lbl">Demand foresight</div></div>
+        <div class="card stat"><div class="num">1</div><div class="lbl">Unified dashboard</div></div>
+      </div>
+      <div class="pillrow" style="justify-content:center;margin-top:2rem">
+        <span class="pill">Thank you</span>
+        <span class="pill">🚜 Caterpillar Hackathon</span>
+      </div>
+    </div>
+  </section>
+
+</div>
+
+<div class="dots" id="dots"></div>
+<div class="prog" id="prog"></div>
+<div class="hint"><kbd>←</kbd> <kbd>→</kbd> navigate · <kbd>F</kbd> fullscreen</div>
+
+<script>
+  const slides=[...document.querySelectorAll('.slide')];
+  const dotsWrap=document.getElementById('dots');
+  const prog=document.getElementById('prog');
+  const cur=document.getElementById('cur');
+  document.getElementById('tot').textContent=String(slides.length).padStart(2,'0');
+  let i=0;
+  slides.forEach((_,n)=>{const d=document.createElement('div');d.className='dot';d.onclick=()=>go(n);dotsWrap.appendChild(d);});
+  const dots=[...document.querySelectorAll('.dot')];
+  function go(n){
+    i=Math.max(0,Math.min(slides.length-1,n));
+    slides.forEach((s,k)=>s.classList.toggle('active',k===i));
+    dots.forEach((d,k)=>d.classList.toggle('on',k===i));
+    prog.style.width=((i+1)/slides.length*100)+'%';
+    cur.textContent=String(i+1).padStart(2,'0');
+  }
+  document.addEventListener('keydown',e=>{
+    if(e.key==='ArrowRight'||e.key===' '||e.key==='PageDown')go(i+1);
+    else if(e.key==='ArrowLeft'||e.key==='PageUp')go(i-1);
+    else if(e.key==='Home')go(0);else if(e.key==='End')go(slides.length-1);
+    else if(e.key.toLowerCase()==='f'){document.fullscreenElement?document.exitFullscreen():document.documentElement.requestFullscreen();}
+  });
+  let sx=0;
+  document.addEventListener('touchstart',e=>sx=e.touches[0].clientX);
+  document.addEventListener('touchend',e=>{const dx=e.changedTouches[0].clientX-sx;if(Math.abs(dx)>50)go(i+(dx<0?1:-1));});
+  go(0);
+</script>
+</body>
+</html>
