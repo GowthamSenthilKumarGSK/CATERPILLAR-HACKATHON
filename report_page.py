@@ -76,7 +76,8 @@ def render_report_page(today):
       params=(today.strftime("%Y-%m-%d"),),
   )
 
-  rental_anom = pd.read_sql_query("SELECT * FROM EquipmentRental", conn)
+  rental_anom = pd.read_sql_query("""SELECT r.equipment_id, e.type, r.operator_id, r.site_id, r.expected_return_date,r.engine_hours_per_day,r.idle_hours_per_day
+          FROM rentals r JOIN equipment e ON r.equipment_id = e.equipment_id""", conn)
   conn.close()
 
   total_units = sum(status_counts.values())
@@ -143,14 +144,14 @@ def render_report_page(today):
 
         high_idle = len(
             rental_anom[
-                rental_anom["IdleHoursPerDay"]
-                > rental_anom["EngineHoursPerDay"]
+                rental_anom["idle_hours_per_day"]
+                > rental_anom["engine_hours_per_day"]
             ]
         )
         unassigned = len(
             rental_anom[
-                rental_anom["SiteID"].isna()
-                | rental_anom["LastOperatorID"].isna()
+                rental_anom["site_id"].isna()
+                | rental_anom["operator_id"].isna()
             ]
         )
 
