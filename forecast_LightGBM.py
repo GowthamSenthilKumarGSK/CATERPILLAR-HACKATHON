@@ -1,32 +1,29 @@
 """
-Equipment rental demand forecasting.
+Equipment rental demand forecasting -- simplified.
 
-Forecasts demand (rental_count) at the (site_id, equipment_type, week/month) grain,
-which is the grain that actually answers "what equipment will site X need at time Y".
+Demand is defined as one thing only: total working (engine) hours per
+(site_id, equipment_type, week). No rental counts, no switchable targets, no
+Poisson/Tweedie objective selection -- just plain regression.
 
-Key design choices vs. a naive first pass:
-  - Forecasting grain is (site_id, equipment_type, period), not a single blended
-    company-wide series. A blended total cannot tell you what to pre-position where.
-  - Sparse combinations (few historical rentals) fall back to a simple seasonal-naive
-    baseline instead of being force-fit with a model that has no data to learn from.
-  - A single *global* gradient-boosted model is trained across all (site, type) series
-    with site/type as categorical features. This lets thin-history combinations borrow
-    statistical strength from similar ones, which per-series ARIMA/ETS cannot do.
-  - Validation is strictly time-ordered walk-forward (expanding window), never a random
-    shuffle split, and out-of-sample error is what gets reported -- not in-sample fit.
-  - Forecasts are produced as quantiles (median + upper) so pre-positioning decisions
-    can use a safety-stock style buffer instead of a single point guess.
+Two models, compared honestly on the same held-out weeks:
+  - LightGBM: one global model across all (site, type) series, using lag/
+    rolling features + calendar seasonality.
+  - ARIMA (auto_arima): a simple univariate model fit per (site, type) series.
+
+Validation is walk-forward (train on the past, predict the next weeks, never
+shuffle) -- the only correct way to validate a time series model.
 """
 
 from __future__ import annotations
 
 import sqlite3
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
+import pmdarima as pm
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 warnings.filterwarnings("ignore")
@@ -35,524 +32,453 @@ RANDOM_STATE = 42
 
 
 # --------------------------------------------------------------------------- #
-# 1. Data loading
+# 1. Load data
 # --------------------------------------------------------------------------- #
 
 def load_joined_rental_data(db_path: str = "equipment_rental.db") -> pd.DataFrame:
-    """Load rentals joined with equipment type/status/rate."""
+    """Load rentals joined with equipment type."""
     conn = sqlite3.connect(db_path)
     rentals = pd.read_sql_query(
         """
-        SELECT r.id,
-               r.equipment_id,
-               r.operator_id,
-               r.site_id,
-               r.check_in_date,
-               r.expected_return_date,
-               r.actual_return_date,
-               r.rental_days,
-               r.is_returned,
-               r.engine_hours_per_day,
-               r.idle_hours_per_day,
-               e.type AS equipment_type,
-               e.status AS equipment_status,
-               e.daily_rental_rate
+        SELECT r.id, r.site_id, r.check_in_date, r.rental_days,
+               r.engine_hours_per_day, e.type AS equipment_type
         FROM rentals r
         LEFT JOIN equipment e ON r.equipment_id = e.equipment_id
         """,
         conn,
-        parse_dates=["check_in_date", "expected_return_date", "actual_return_date"],
+        parse_dates=["check_in_date"],
     )
     conn.close()
 
-    # Rows with no check-in date carry no time-series information -- drop rather
-    # than silently losing them further downstream without a record of it.
-    n_before = len(rentals)
     rentals = rentals.dropna(subset=["check_in_date"]).copy()
-    dropped = n_before - len(rentals)
-    if dropped:
-        print(f"[load_joined_rental_data] Dropped {dropped} row(s) with no check_in_date.")
-
     rentals["site_id"] = rentals["site_id"].fillna("Unknown")
     rentals["equipment_type"] = rentals["equipment_type"].fillna("Unknown")
-    rentals["equipment_status"] = rentals["equipment_status"].fillna("Unknown")
     return rentals
 
 
 # --------------------------------------------------------------------------- #
-# 2. Building a clean, gap-aware panel at (site, type, period) grain
+# 2. Build weekly working-hours panel
 # --------------------------------------------------------------------------- #
 
-def build_demand_panel(
-    rentals: pd.DataFrame,
-    freq: str = "W-MON",
-    as_of: pd.Timestamp | None = None,
-) -> pd.DataFrame:
+def build_demand_panel(rentals: pd.DataFrame, freq: str = "W-MON") -> pd.DataFrame:
     """
-    Build a complete (site_id, equipment_type, period) panel of rental counts,
-    filling true gaps with 0 -- but only up to `as_of`, so we never manufacture
-    a fake "flatline" beyond the point where data actually stops being collected.
+    Build a complete (site_id, equipment_type, week) panel of total working
+    hours, filling weeks with no activity as 0.
 
-    freq="W-MON" (weekly) is a sensible default for pre-positioning; use "MS" for
-    monthly if the business cadence is monthly. Do not go finer than the data supports.
+    A rental's engine hours are spread across every week it actually runs
+    through (e.g. a 15-day rental contributes hours to all 3 weeks it spans),
+    not just its start week.
     """
-    if as_of is None:
-        as_of = rentals["check_in_date"].max()
+    r = rentals.copy()
+    r["rental_days"] = r["rental_days"].fillna(1).clip(lower=1).astype(int)
+    r["engine_hours_per_day"] = r["engine_hours_per_day"].fillna(0.0)
+    as_of = r["check_in_date"].max()
 
-    rentals = rentals.copy()
-    rentals["period"] = rentals["check_in_date"].dt.to_period(
-        "W" if freq.startswith("W") else "M"
-    ).dt.to_timestamp(how="start")
+    # Expand each rental into one row per active day it ran.
+    rep_idx = np.repeat(np.arange(len(r)), r["rental_days"].to_numpy())
+    offsets = np.concatenate([np.arange(n) for n in r["rental_days"]])
+    daily = r.iloc[rep_idx].reset_index(drop=True)
+    daily["active_date"] = daily["check_in_date"].to_numpy() + pd.to_timedelta(offsets, unit="D")
+    daily = daily[daily["active_date"] <= as_of]  # don't project hours into the future
 
-    counts = (
-        rentals.groupby(["site_id", "equipment_type", "period"])
-        .size()
-        .rename("rental_count")
+    daily["week"] = daily["active_date"].dt.to_period("W").dt.to_timestamp(how="start")
+    hours = (
+        daily.groupby(["site_id", "equipment_type", "week"])["engine_hours_per_day"]
+        .sum()
+        .rename("working_hours")
         .reset_index()
     )
 
-    sites = rentals["site_id"].unique()
-    types = rentals["equipment_type"].unique()
-    full_range = pd.date_range(
-        rentals["period"].min(), pd.Timestamp(as_of), freq=freq
-    )
+    # Fill in every (site, type, week) combination, including weeks with 0 hours.
+    sites = r["site_id"].unique()
+    types = r["equipment_type"].unique()
+    full_weeks = pd.date_range(hours["week"].min(), hours["week"].max(), freq=freq)
+    idx = pd.MultiIndex.from_product([sites, types, full_weeks], names=["site_id", "equipment_type", "week"])
 
-    idx = pd.MultiIndex.from_product(
-        [sites, types, full_range], names=["site_id", "equipment_type", "period"]
-    )
-    panel = (
-        counts.set_index(["site_id", "equipment_type", "period"])
-        .reindex(idx, fill_value=0)
-        .reset_index()
-    )
-    panel = panel.sort_values(["site_id", "equipment_type", "period"]).reset_index(drop=True)
+    panel = pd.DataFrame(index=idx).reset_index()
+    panel = panel.merge(hours, on=["site_id", "equipment_type", "week"], how="left")
+    panel["working_hours"] = panel["working_hours"].fillna(0.0)
+    panel = panel.sort_values(["site_id", "equipment_type", "week"]).reset_index(drop=True)
     return panel
 
 
 # --------------------------------------------------------------------------- #
-# 3. Feature engineering (leak-safe: every feature at row t uses only data < t)
+# 3. Features for LightGBM
 # --------------------------------------------------------------------------- #
 
-def add_features(panel: pd.DataFrame, lags: tuple[int, ...] = (1, 2, 3, 4, 8, 52)) -> pd.DataFrame:
-    """
-    Adds lag and rolling features per (site_id, equipment_type) group.
-    All lag/rolling windows are shifted so no feature at row t can see y at t.
-    """
-    df = panel.copy()
-    df = df.sort_values(["site_id", "equipment_type", "period"])
-    grp = df.groupby(["site_id", "equipment_type"])["rental_count"]
+def add_features(panel: pd.DataFrame, lags: tuple[int, ...] = (1, 2, 3, 4, 8)) -> pd.DataFrame:
+    """Lag + rolling + calendar features. All shifted so no row sees its own target."""
+    df = panel.sort_values(["site_id", "equipment_type", "week"]).copy()
+    grp = df.groupby(["site_id", "equipment_type"])["working_hours"]
 
     for lag in lags:
         df[f"lag_{lag}"] = grp.shift(lag)
 
-    # Rolling stats computed on already-shifted (lag_1) series so the current
-    # period's own value never leaks into its own rolling mean/std.
     shifted = grp.shift(1)
-    df["roll_mean_4"] = shifted.groupby([df["site_id"], df["equipment_type"]]).transform(
-        lambda s: s.rolling(4, min_periods=1).mean()
-    )
-    df["roll_mean_8"] = shifted.groupby([df["site_id"], df["equipment_type"]]).transform(
-        lambda s: s.rolling(8, min_periods=1).mean()
-    )
-    df["roll_std_4"] = shifted.groupby([df["site_id"], df["equipment_type"]]).transform(
-        lambda s: s.rolling(4, min_periods=1).std()
-    )
+    key = [df["site_id"], df["equipment_type"]]
+    df["roll_mean_4"] = shifted.groupby(key).transform(lambda s: s.rolling(4, min_periods=1).mean())
+    df["roll_mean_8"] = shifted.groupby(key).transform(lambda s: s.rolling(8, min_periods=1).mean())
 
-    df["month"] = df["period"].dt.month
-    df["weekofyear"] = df["period"].dt.isocalendar().week.astype(int)
-    df["quarter"] = df["period"].dt.quarter
-
-    # How long this (site, type) has been observed -- helps the model learn to
-    # discount predictions for brand-new combinations vs. long-running ones.
-    df["periods_observed"] = df.groupby(["site_id", "equipment_type"]).cumcount()
+    df["month"] = df["week"].dt.month
+    df["weekofyear"] = df["week"].dt.isocalendar().week.astype(int)
 
     df["site_id"] = df["site_id"].astype("category")
     df["equipment_type"] = df["equipment_type"].astype("category")
     return df
 
 
+FEATURE_COLS = [
+    "site_id", "equipment_type",
+    "lag_1", "lag_2", "lag_3", "lag_4", "lag_8",
+    "roll_mean_4", "roll_mean_8",
+    "month", "weekofyear",
+]
+
+
 # --------------------------------------------------------------------------- #
-# 4. Walk-forward (expanding window) validation -- the honest way to test a
-#    time series model. Never shuffle, never randomly split.
+# 4. Walk-forward validation (LightGBM: one global model, all series at once)
 # --------------------------------------------------------------------------- #
 
 @dataclass
-class WalkForwardResult:
+class ValidationResult:
     fold_metrics: pd.DataFrame
-    oos_predictions: pd.DataFrame
     mean_mae: float
     mean_rmse: float
 
 
-def walk_forward_validate(
-    features_df: pd.DataFrame,
-    feature_cols: list[str],
-    target_col: str = "rental_count",
-    n_folds: int = 4,
-    min_train_periods: int = 12,
-    horizon: int = 1,
-    model_params: dict | None = None,
-) -> WalkForwardResult:
+def validate_lightgbm(features_df: pd.DataFrame, n_folds: int = 4, min_train_weeks: int = 20) -> ValidationResult:
     """
-    Expanding-window walk-forward validation.
-
-    For each fold, train on all periods up to cutoff_k, predict the next `horizon`
-    period(s), score only on those held-out rows, then advance the cutoff. This
-    mirrors how the model will actually be used in production (train on everything
-    known so far, forecast forward) and avoids the classic time-series leakage bug
-    of a random train/test split, which lets the model "see the future" via
-    neighbouring rows in the same series.
+    Expanding-window walk-forward validation: train on all weeks up to a
+    cutoff, predict the next week, score only on that held-out week, advance
+    the cutoff, repeat. Never a random train/test split -- that would let the
+    model see the future through neighboring weeks in the same series.
     """
-    periods = sorted(features_df["period"].unique())
-    if len(periods) < min_train_periods + n_folds:
+    weeks = sorted(features_df["week"].unique())
+    if len(weeks) < min_train_weeks + n_folds:
         raise ValueError(
-            f"Not enough periods ({len(periods)}) for {n_folds} folds with "
-            f"min_train_periods={min_train_periods}. Reduce n_folds/min_train_periods "
-            f"or provide more history."
+            f"Only {len(weeks)} weeks available; need at least "
+            f"{min_train_weeks + n_folds} for {n_folds} honest folds. "
+            f"Reduce n_folds/min_train_weeks or provide more history."
         )
 
-    default_params = dict(
-        n_estimators=300,
-        learning_rate=0.05,
-        num_leaves=31,
-        min_child_samples=10,
-        objective="poisson",  # rental counts are non-negative integers -> Poisson loss
-        random_state=RANDOM_STATE,
-        verbose=-1,
-    )
-    if model_params:
-        default_params.update(model_params)
-
-    fold_rows = []
-    oos_frames = []
-
-    test_start_idx = len(periods) - n_folds * horizon
+    rows = []
+    test_start = len(weeks) - n_folds
     for fold in range(n_folds):
-        cutoff_idx = test_start_idx + fold * horizon
-        train_periods = periods[:cutoff_idx]
-        test_periods = periods[cutoff_idx: cutoff_idx + horizon]
-        if len(train_periods) < min_train_periods or not test_periods:
+        cutoff = test_start + fold
+        train_weeks, test_week = weeks[:cutoff], weeks[cutoff]
+
+        train = features_df[features_df["week"].isin(train_weeks)].dropna(subset=FEATURE_COLS)
+        test = features_df[features_df["week"] == test_week].dropna(subset=FEATURE_COLS)
+        if train.empty or test.empty:
             continue
 
-        train_df = features_df[features_df["period"].isin(train_periods)].dropna(subset=feature_cols)
-        test_df = features_df[features_df["period"].isin(test_periods)].dropna(subset=feature_cols)
-        if train_df.empty or test_df.empty:
-            continue
-        if train_df[target_col].sum() == 0:
-            # A fold with literally zero historical demand can't train a Poisson
-            # model (and isn't a meaningful fold to score anyway) -- skip it
-            # rather than letting LightGBM fail with an opaque internal error.
-            continue
-
-        model = lgb.LGBMRegressor(**default_params)
-        model.fit(
-            train_df[feature_cols], train_df[target_col],
-            categorical_feature=["site_id", "equipment_type"],
+        model = lgb.LGBMRegressor(
+            n_estimators=200, learning_rate=0.05, num_leaves=31,
+            min_child_samples=10, random_state=RANDOM_STATE, verbose=-1,
         )
-        preds = np.clip(model.predict(test_df[feature_cols]), 0, None)
+        model.fit(train[FEATURE_COLS], train["working_hours"],
+                   categorical_feature=["site_id", "equipment_type"])
+        preds = np.clip(model.predict(test[FEATURE_COLS]), 0, None)
 
-        mae = mean_absolute_error(test_df[target_col], preds)
-        rmse = np.sqrt(mean_squared_error(test_df[target_col], preds))
-        fold_rows.append({
+        rows.append({
             "fold": fold,
-            "train_periods": len(train_periods),
-            "test_period_start": test_periods[0],
-            "n_test_rows": len(test_df),
-            "mae": mae,
-            "rmse": rmse,
+            "test_week": test_week,
+            "n_test_rows": len(test),
+            "mae": mean_absolute_error(test["working_hours"], preds),
+            "rmse": np.sqrt(mean_squared_error(test["working_hours"], preds)),
         })
 
-        oos = test_df[["site_id", "equipment_type", "period", target_col]].copy()
-        oos["prediction"] = preds
-        oos["fold"] = fold
-        oos_frames.append(oos)
+    if not rows:
+        raise ValueError("No valid folds produced -- check week count vs. n_folds/min_train_weeks.")
 
-    if not fold_rows:
-        raise ValueError("No valid folds were produced -- check period count vs. n_folds/min_train_periods.")
+    fold_metrics = pd.DataFrame(rows)
+    return ValidationResult(fold_metrics, fold_metrics["mae"].mean(), fold_metrics["rmse"].mean())
 
-    fold_metrics = pd.DataFrame(fold_rows)
-    oos_predictions = pd.concat(oos_frames, ignore_index=True)
-    return WalkForwardResult(
-        fold_metrics=fold_metrics,
-        oos_predictions=oos_predictions,
-        mean_mae=fold_metrics["mae"].mean(),
-        mean_rmse=fold_metrics["rmse"].mean(),
+
+def fit_final_lightgbm(features_df: pd.DataFrame) -> lgb.LGBMRegressor:
+    """Fit on all available data -- this is the deployed model."""
+    train = features_df.dropna(subset=FEATURE_COLS)
+    model = lgb.LGBMRegressor(
+        n_estimators=200, learning_rate=0.05, num_leaves=31,
+        min_child_samples=10, random_state=RANDOM_STATE, verbose=-1,
     )
+    model.fit(train[FEATURE_COLS], train["working_hours"],
+               categorical_feature=["site_id", "equipment_type"])
+    return model
+
+
+def forecast_lightgbm(model: lgb.LGBMRegressor, features_df: pd.DataFrame, horizon: int = 8) -> pd.DataFrame:
+    """Recursive multi-step forecast: each predicted week feeds the next week's lag features."""
+    history = features_df[["site_id", "equipment_type", "week", "working_hours"]].copy()
+    last_week = features_df["week"].max()
+    future_weeks = pd.date_range(last_week + pd.Timedelta(weeks=1), periods=horizon, freq="W-MON")
+    lag_numbers = [1, 2, 3, 4, 8]
+
+    all_rows = []
+    for future_week in future_weeks:
+        step_rows = []
+        for (site, etype), g in history.groupby(["site_id", "equipment_type"]):
+            vals = g.sort_values("week")["working_hours"].tolist()
+            row = {"site_id": site, "equipment_type": etype, "week": future_week}
+            for lag in lag_numbers:
+                row[f"lag_{lag}"] = vals[-lag] if len(vals) >= lag else 0.0
+            row["roll_mean_4"] = np.mean(vals[-4:]) if vals else 0.0
+            row["roll_mean_8"] = np.mean(vals[-8:]) if vals else 0.0
+            row["month"] = future_week.month
+            row["weekofyear"] = int(future_week.isocalendar().week)
+            step_rows.append(row)
+
+        step_df = pd.DataFrame(step_rows)
+        step_df["site_id"] = step_df["site_id"].astype(pd.CategoricalDtype(history["site_id"].unique()))
+        step_df["equipment_type"] = step_df["equipment_type"].astype(pd.CategoricalDtype(history["equipment_type"].unique()))
+
+        preds = np.clip(model.predict(step_df[FEATURE_COLS]), 0, None)
+        step_df["forecast"] = preds
+        all_rows.append(step_df[["site_id", "equipment_type", "week", "forecast"]])
+
+        new_hist = step_df[["site_id", "equipment_type", "week"]].copy()
+        new_hist["working_hours"] = preds
+        history = pd.concat([history, new_hist], ignore_index=True)
+
+    return pd.concat(all_rows, ignore_index=True)
 
 
 # --------------------------------------------------------------------------- #
-# 5. Baseline models -- required for two reasons:
-#      (a) a sparse (site, type) combo has no business being fit by a 300-tree
-#          gradient booster; a seasonal-naive baseline is safer and often better.
-#      (b) any "sophisticated" model must beat this baseline out-of-sample or
-#          it isn't earning its complexity.
+# 5. ARIMA (per site/type series, auto-selected order)
 # --------------------------------------------------------------------------- #
 
-def seasonal_naive_forecast(series: pd.Series, season_length: int, periods: int) -> pd.Series:
-    """Forecast = value from `season_length` periods ago, repeated forward."""
-    if len(series) < season_length:
-        # Not even one full season of history -- fall back to the mean.
-        base = series.mean() if len(series) else 0.0
-        return pd.Series([base] * periods)
-    last_season = series.iloc[-season_length:].values
-    reps = int(np.ceil(periods / season_length))
-    return pd.Series(np.tile(last_season, reps)[:periods])
+def validate_arima(panel: pd.DataFrame, n_folds: int = 4, min_train_weeks: int = 20) -> ValidationResult:
+    """
+    Same walk-forward scheme as LightGBM, but one ARIMA model per (site, type)
+    series -- ARIMA cannot pool across series the way the global LightGBM
+    model does, so it must be refit separately for every combination, every fold.
+    """
+    weeks = sorted(panel["week"].unique())
+    if len(weeks) < min_train_weeks + n_folds:
+        raise ValueError(f"Only {len(weeks)} weeks available; need at least {min_train_weeks + n_folds}.")
 
-
-def evaluate_baseline_walk_forward(
-    panel: pd.DataFrame,
-    group_cols: tuple[str, str] = ("site_id", "equipment_type"),
-    season_length: int = 4,
-    n_folds: int = 4,
-    horizon: int = 1,
-) -> pd.DataFrame:
-    """Same expanding-window folds as the ML model, scored against seasonal-naive."""
-    periods = sorted(panel["period"].unique())
-    test_start_idx = len(periods) - n_folds * horizon
     rows = []
+    test_start = len(weeks) - n_folds
     for fold in range(n_folds):
-        cutoff_idx = test_start_idx + fold * horizon
-        train_periods = periods[:cutoff_idx]
-        test_periods = periods[cutoff_idx: cutoff_idx + horizon]
-        if not train_periods or not test_periods:
-            continue
-        for (site, etype), g in panel.groupby(list(group_cols)):
-            train_g = g[g["period"].isin(train_periods)].sort_values("period")
-            test_g = g[g["period"].isin(test_periods)].sort_values("period")
-            if test_g.empty:
+        cutoff = test_start + fold
+        train_weeks, test_week = weeks[:cutoff], weeks[cutoff]
+
+        preds, actuals = [], []
+        for (site, etype), g in panel.groupby(["site_id", "equipment_type"]):
+            train_g = g[g["week"].isin(train_weeks)].sort_values("week")
+            test_g = g[g["week"] == test_week]
+            if train_g.empty or test_g.empty or len(train_g) < min_train_weeks:
                 continue
-            fc = seasonal_naive_forecast(train_g["rental_count"], season_length, len(test_g))
-            mae = mean_absolute_error(test_g["rental_count"].values, fc.values)
-            rows.append({"fold": fold, "site_id": site, "equipment_type": etype, "mae": mae})
+            try:
+                model = pm.auto_arima(
+                    train_g["working_hours"], seasonal=False, stepwise=True,
+                    suppress_warnings=True, error_action="ignore", max_p=3, max_q=3,
+                )
+                pred = max(0.0, model.predict(n_periods=1).iloc[0])
+            except Exception:
+                pred = train_g["working_hours"].iloc[-4:].mean()  # fallback if a fit fails
+            preds.append(pred)
+            actuals.append(test_g["working_hours"].iloc[0])
+
+        if not actuals:
+            continue
+        rows.append({
+            "fold": fold,
+            "test_week": test_week,
+            "n_test_rows": len(actuals),
+            "mae": mean_absolute_error(actuals, preds),
+            "rmse": np.sqrt(mean_squared_error(actuals, preds)),
+        })
+
+    if not rows:
+        raise ValueError("No valid ARIMA folds produced -- check week count vs. n_folds/min_train_weeks.")
+
+    fold_metrics = pd.DataFrame(rows)
+    return ValidationResult(fold_metrics, fold_metrics["mae"].mean(), fold_metrics["rmse"].mean())
+
+
+def fit_final_arima_models(panel: pd.DataFrame) -> dict[tuple[str, str], object]:
+    """
+    Fit one ARIMA model per (site, type) on all available data. Returns a dict
+    keyed by (site_id, equipment_type) -> fitted pmdarima model (or None if
+    fitting failed, in which case forecast_arima falls back to a simple mean).
+    """
+    models = {}
+    for (site, etype), g in panel.groupby(["site_id", "equipment_type"]):
+        series = g.sort_values("week")["working_hours"]
+        try:
+            models[(site, etype)] = pm.auto_arima(
+                series, seasonal=False, stepwise=True,
+                suppress_warnings=True, error_action="ignore", max_p=3, max_q=3,
+            )
+        except Exception:
+            models[(site, etype)] = None
+    return models
+
+
+def forecast_arima(panel: pd.DataFrame, models: dict[tuple[str, str], object], horizon: int = 8) -> pd.DataFrame:
+    """Forecast forward using already-fitted per-(site, type) ARIMA models."""
+    rows = []
+    for (site, etype), g in panel.groupby(["site_id", "equipment_type"]):
+        series = g.sort_values("week")["working_hours"]
+        last_week = g["week"].max()
+        future_weeks = pd.date_range(last_week + pd.Timedelta(weeks=1), periods=horizon, freq="W-MON")
+        model = models.get((site, etype))
+        if model is not None:
+            preds = np.clip(model.predict(n_periods=horizon).to_numpy(), 0, None)
+        else:
+            preds = np.full(horizon, series.iloc[-4:].mean())  # fallback if fitting failed
+        for wk, p in zip(future_weeks, preds):
+            rows.append({"site_id": site, "equipment_type": etype, "week": wk, "forecast": p})
     return pd.DataFrame(rows)
 
 
 # --------------------------------------------------------------------------- #
-# 6. Final model fit on ALL data + forward forecast with quantiles
+# 6. Orchestration
 # --------------------------------------------------------------------------- #
 
-@dataclass
-class FinalForecast:
-    point_forecast: pd.DataFrame       # median forecast per (site, type, future period)
-    upper_forecast: pd.DataFrame       # e.g. 80th percentile, for pre-positioning buffer
-    feature_importance: pd.DataFrame
-
-
-def fit_final_models_and_forecast(
-    features_df: pd.DataFrame,
-    feature_cols: list[str],
-    target_col: str = "rental_count",
-    horizon: int = 8,
-    freq: str = "W-MON",
-    quantile_upper: float = 0.8,
-) -> FinalForecast:
-    """
-    Fits on ALL available history (this is the deployed model, not a validation
-    fold) and produces a recursive multi-step-ahead forecast per (site, type).
-
-    Two models are trained: a median-point Poisson model, and a quantile model at
-    `quantile_upper` so downstream pre-positioning can use (median, buffer) rather
-    than a single number that will be wrong roughly half the time by construction.
-    """
-    train_df = features_df.dropna(subset=feature_cols)
-
-    point_model = lgb.LGBMRegressor(
-        n_estimators=300, learning_rate=0.05, num_leaves=31,
-        min_child_samples=10, objective="poisson",
-        random_state=RANDOM_STATE, verbose=-1,
-    )
-    point_model.fit(train_df[feature_cols], train_df[target_col],
-                     categorical_feature=["site_id", "equipment_type"])
-
-    upper_model = lgb.LGBMRegressor(
-        n_estimators=300, learning_rate=0.05, num_leaves=31,
-        min_child_samples=10, objective="quantile", alpha=quantile_upper,
-        random_state=RANDOM_STATE, verbose=-1,
-    )
-    upper_model.fit(train_df[feature_cols], train_df[target_col],
-                     categorical_feature=["site_id", "equipment_type"])
-
-    # Recursive forecasting: step forward one period at a time per (site, type),
-    # appending each prediction to history so later lag features see prior forecasts.
-    last_period = features_df["period"].max()
-    future_periods = pd.date_range(
-        last_period + pd.tseries.frequencies.to_offset(freq), periods=horizon, freq=freq
-    )
-
-    history = features_df[["site_id", "equipment_type", "period", target_col]].copy()
-    point_rows, upper_rows = [], []
-
-    lag_numbers = sorted(int(c.split("_")[1]) for c in feature_cols if c.startswith("lag_"))
-    max_lag = max(lag_numbers) if lag_numbers else 1
-
-    for future_period in future_periods:
-        step_rows = []
-        for (site, etype), g in history.groupby(["site_id", "equipment_type"]):
-            g = g.sort_values("period")
-            vals = g[target_col].tolist()
-            row = {"site_id": site, "equipment_type": etype, "period": future_period}
-            for lag in lag_numbers:
-                row[f"lag_{lag}"] = vals[-lag] if len(vals) >= lag else 0.0
-            recent = vals[-max(4, 1):]
-            row["roll_mean_4"] = np.mean(vals[-4:]) if vals else 0.0
-            row["roll_mean_8"] = np.mean(vals[-8:]) if vals else 0.0
-            row["roll_std_4"] = np.std(vals[-4:]) if len(vals) >= 2 else 0.0
-            row["month"] = future_period.month
-            row["weekofyear"] = int(future_period.isocalendar().week)
-            row["quarter"] = future_period.quarter
-            row["periods_observed"] = len(vals)
-            step_rows.append(row)
-
-        step_df = pd.DataFrame(step_rows)
-        step_df["site_id"] = step_df["site_id"].astype(
-            pd.CategoricalDtype(categories=history["site_id"].unique())
-        )
-        step_df["equipment_type"] = step_df["equipment_type"].astype(
-            pd.CategoricalDtype(categories=history["equipment_type"].unique())
-        )
-
-        point_pred = np.clip(point_model.predict(step_df[feature_cols]), 0, None)
-        upper_pred = np.clip(upper_model.predict(step_df[feature_cols]), 0, None)
-        upper_pred = np.maximum(upper_pred, point_pred)  # upper must not be below median
-
-        step_df["point_forecast"] = point_pred
-        step_df["upper_forecast"] = upper_pred
-        point_rows.append(step_df[["site_id", "equipment_type", "period", "point_forecast"]])
-        upper_rows.append(step_df[["site_id", "equipment_type", "period", "upper_forecast"]])
-
-        # Feed the point forecast back in as "history" for the next recursive step.
-        new_hist = step_df[["site_id", "equipment_type", "period"]].copy()
-        new_hist[target_col] = point_pred
-        history = pd.concat([history, new_hist], ignore_index=True)
-
-    point_forecast = pd.concat(point_rows, ignore_index=True)
-    upper_forecast = pd.concat(upper_rows, ignore_index=True)
-
-    importance = pd.DataFrame({
-        "feature": feature_cols,
-        "importance": point_model.feature_importances_,
-    }).sort_values("importance", ascending=False)
-
-    return FinalForecast(point_forecast, upper_forecast, importance)
-
-
-# --------------------------------------------------------------------------- #
-# 7. End-to-end orchestration
-# --------------------------------------------------------------------------- #
-
-FEATURE_COLS = [
-    "site_id", "equipment_type",
-    "lag_1", "lag_2", "lag_3", "lag_4", "lag_8", "lag_52",
-    "roll_mean_4", "roll_mean_8", "roll_std_4",
-    "month", "weekofyear", "quarter", "periods_observed",
-]
-
-
-def run_pipeline(
-    db_path: str = "equipment_rental.db",
-    freq: str = "W-MON",
-    n_folds: int = 4,
-    horizon: int = 8,
-) -> dict:
+def run_pipeline(db_path: str = "equipment_rental.db", n_folds: int = 4, horizon: int = 8) -> dict:
     rentals = load_joined_rental_data(db_path)
-    panel = build_demand_panel(rentals, freq=freq)
+    panel = build_demand_panel(rentals)
     features_df = add_features(panel)
 
-    available_feats = [c for c in FEATURE_COLS if c in features_df.columns]
-
-    n_periods = features_df["period"].nunique()
-    min_train_periods = max(8, n_periods // 3)
-
-    # A raw period count can be misleading: lag features (esp. long ones like
-    # lag_52) mean many early rows get dropped by dropna(), and a long stretch
-    # of true zeros (e.g. a real gap in data collection) can leave a fold with
-    # literally no positive demand to train on. Check what actually survives
-    # feature engineering, not just how many calendar periods exist.
-    usable = features_df.dropna(subset=available_feats)
-    usable_periods_with_signal = usable.loc[usable["rental_count"] > 0, "period"].nunique()
-
-    if n_periods < min_train_periods + n_folds:
+    n_weeks = features_df["week"].nunique()
+    min_train_weeks = max(12, n_weeks // 3)
+    if n_weeks < min_train_weeks + n_folds:
         raise ValueError(
-            f"Only {n_periods} periods of history available at freq='{freq}'. "
-            f"That is too little for {n_folds} honest out-of-sample folds. "
-            f"Options: reduce n_folds, switch freq to a coarser grain (e.g. 'MS' "
-            f"instead of 'W-MON'), or use seasonal_naive_forecast() directly as a "
-            f"baseline until more history accumulates. Do not force-fit ML models "
-            f"on this little data -- the reported metrics would not be trustworthy."
+            f"Only {n_weeks} weeks of history. Need at least {min_train_weeks + n_folds} "
+            f"for {n_folds} honest folds -- reduce n_folds or provide more data."
         )
 
-    if usable_periods_with_signal < min_train_periods:
+    # Simple sparsity check: if almost every (site, type, week) row is zero,
+    # a low MAE just means "the model correctly guessed zero", not that it
+    # learned anything -- results wouldn't be trustworthy either way.
+    nonzero_share = (panel["working_hours"] > 0).mean()
+    if nonzero_share < 0.10:
         raise ValueError(
-            f"After feature engineering (dropna on lag/rolling columns), only "
-            f"{usable_periods_with_signal} periods have any non-zero demand at all "
-            f"(out of {n_periods} calendar periods). This dataset is too sparse for "
-            f"walk-forward validation to produce a meaningful fold -- you'll get "
-            f"'no valid folds' or an all-zero training fold. Fixes, in order of "
-            f"preference: (1) use a coarser freq ('MS' monthly instead of weekly), "
-            f"(2) drop long lags like lag_52/lag_8 from FEATURE_COLS if you don't "
-            f"have that much real history yet, (3) fall back to "
-            f"seasonal_naive_forecast()/evaluate_baseline_walk_forward() only until "
-            f"more real data accumulates."
+            f"Only {nonzero_share:.1%} of (site, type, week) rows have any working "
+            f"hours at all -- this data is too sparse for a meaningful forecast. "
+            f"Provide more history or aggregate to a coarser grain."
         )
 
-    wf_result = walk_forward_validate(
-        features_df, available_feats,
-        n_folds=n_folds, min_train_periods=min_train_periods, horizon=1,
-    )
-    baseline_mae_df = evaluate_baseline_walk_forward(panel, n_folds=n_folds, horizon=1)
+    lgbm_val = validate_lightgbm(features_df, n_folds=n_folds, min_train_weeks=min_train_weeks)
+    arima_val = validate_arima(panel, n_folds=n_folds, min_train_weeks=min_train_weeks)
 
-    final = fit_final_models_and_forecast(
-        features_df, available_feats, horizon=horizon, freq=freq,
-    )
+    lgbm_model = fit_final_lightgbm(features_df)
+    lgbm_forecast = forecast_lightgbm(lgbm_model, features_df, horizon=horizon)
+
+    arima_models = fit_final_arima_models(panel)
+    arima_forecast = forecast_arima(panel, arima_models, horizon=horizon)
 
     return {
         "panel": panel,
         "features_df": features_df,
-        "walk_forward": wf_result,
-        "baseline_mae_df": baseline_mae_df,
-        "final_forecast": final,
+        "lgbm_validation": lgbm_val,
+        "arima_validation": arima_val,
+        "lgbm_model": lgbm_model,
+        "arima_models": arima_models,
+        "lgbm_forecast": lgbm_forecast,
+        "arima_forecast": arima_forecast,
     }
 
 
 def print_pipeline_summary(results: dict) -> None:
-    wf = results["walk_forward"]
-    baseline = results["baseline_mae_df"]
+    lgbm_val = results["lgbm_validation"]
+    arima_val = results["arima_validation"]
 
-    print("=== Walk-forward validation (LightGBM, expanding window, out-of-sample) ===")
-    print(wf.fold_metrics.to_string(index=False))
-    print(f"\nMean OOS MAE:  {wf.mean_mae:.3f}")
-    print(f"Mean OOS RMSE: {wf.mean_rmse:.3f}")
+    print("=== LightGBM: walk-forward validation (out-of-sample, working hours) ===")
+    print(lgbm_val.fold_metrics.to_string(index=False))
+    print(f"Mean MAE: {lgbm_val.mean_mae:.3f}   Mean RMSE: {lgbm_val.mean_rmse:.3f}")
 
-    print("\n=== Seasonal-naive baseline (same folds, for comparison) ===")
-    print(f"Mean baseline MAE: {baseline['mae'].mean():.3f}")
-    lift = (baseline["mae"].mean() - wf.mean_mae) / baseline["mae"].mean() * 100
-    print(f"LightGBM improvement over baseline: {lift:.1f}%")
-    if lift <= 0:
-        print("WARNING: model does not beat the naive baseline -- do not deploy the ML "
-              "model over the baseline until this changes (more data, better features, etc).")
+    print("\n=== ARIMA: walk-forward validation (out-of-sample, working hours) ===")
+    print(arima_val.fold_metrics.to_string(index=False))
+    print(f"Mean MAE: {arima_val.mean_mae:.3f}   Mean RMSE: {arima_val.mean_rmse:.3f}")
 
-    print("\n=== Per (site, equipment_type) out-of-sample MAE ===")
-    print("(A global average can hide poor accuracy on specific sites/types -- check this")
-    print(" before trusting the model for any single site's pre-positioning decision.)")
-    per_group = (
-        wf.oos_predictions.assign(abs_err=lambda d: (d["rental_count"] - d["prediction"]).abs())
-        .groupby(["site_id", "equipment_type"])
-        .agg(mae=("abs_err", "mean"), n_obs=("abs_err", "size"))
-        .sort_values("mae", ascending=False)
-        .reset_index()
+    print("\n=== Comparison ===")
+    better = "LightGBM" if lgbm_val.mean_mae < arima_val.mean_mae else "ARIMA"
+    print(f"{better} has lower out-of-sample MAE "
+          f"(LightGBM={lgbm_val.mean_mae:.3f} vs ARIMA={arima_val.mean_mae:.3f}).")
+
+    print("\n=== LightGBM forecast, next weeks (first 15 rows) ===")
+    print(results["lgbm_forecast"].head(15).to_string(index=False))
+
+    print("\n=== ARIMA forecast, next weeks (first 15 rows) ===")
+    arima_forecast = (
+        results["arima_forecast"]
+        .sort_values(["week", "site_id", "equipment_type"])
     )
-    print(per_group.to_string(index=False))
+    print(arima_forecast.head(15).to_string(index=False))
 
-    print("\n=== Top feature importances (final model, trained on all data) ===")
-    print(results["final_forecast"].feature_importance.head(8).to_string(index=False))
 
-    print("\n=== Forecast (next periods), point + upper(80th pct), first 15 rows ===")
-    merged = results["final_forecast"].point_forecast.merge(
-        results["final_forecast"].upper_forecast, on=["site_id", "equipment_type", "period"]
-    )
-    print(merged.head(15).to_string(index=False))
+# --------------------------------------------------------------------------- #
+# 7. Save / load models for later inference
+# --------------------------------------------------------------------------- #
+
+import json
+from pathlib import Path
+import joblib
+
+
+def save_models(
+    lgbm_model: lgb.LGBMRegressor,
+    arima_models: dict[tuple[str, str], object],
+    out_dir: str = "saved_models",
+) -> None:
+    """
+    Save the final LightGBM model and the full set of per-(site, type) ARIMA
+    models to disk, so both can be reloaded later without refitting.
+
+    Files written to out_dir:
+      - lgbm_model.joblib   -- the fitted LGBMRegressor
+      - arima_models.joblib -- dict {(site_id, equipment_type): fitted pmdarima model or None}
+      - feature_cols.json   -- the exact feature column list/order LightGBM was trained on,
+                                so inference code always matches training exactly
+    """
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    joblib.dump(lgbm_model, out / "lgbm_model.joblib")
+    joblib.dump(arima_models, out / "arima_models.joblib")
+    with open(out / "feature_cols.json", "w") as f:
+        json.dump(FEATURE_COLS, f)
+
+    print(f"Saved LightGBM model, {len(arima_models)} ARIMA models, and feature list to '{out_dir}/'.")
+
+
+def load_models(out_dir: str = "saved_models") -> tuple[lgb.LGBMRegressor, dict[tuple[str, str], object], list[str]]:
+    """Load back everything saved by save_models(). Returns (lgbm_model, arima_models, feature_cols)."""
+    out = Path(out_dir)
+    lgbm_model = joblib.load(out / "lgbm_model.joblib")
+    arima_models = joblib.load(out / "arima_models.joblib")
+    with open(out / "feature_cols.json") as f:
+        feature_cols = json.load(f)
+    return lgbm_model, arima_models, feature_cols
+
+
+def load_or_train_forecast_models(
+    db_path: str = "equipment_rental.db",
+    horizon: int = 8,
+    out_dir: str = "saved_models",
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Load saved demand models if present; otherwise train and save them."""
+    rentals = load_joined_rental_data(db_path)
+    panel = build_demand_panel(rentals)
+    features_df = add_features(panel)
+
+    try:
+        lgbm_model, arima_models, _ = load_models(out_dir)
+    except FileNotFoundError:
+        results = run_pipeline(db_path=db_path, n_folds=1, horizon=horizon)
+        save_models(results["lgbm_model"], results["arima_models"], out_dir=out_dir)
+        lgbm_model, arima_models, _ = load_models(out_dir)
+
+    lgbm_forecast = forecast_lightgbm(lgbm_model, features_df, horizon=horizon)
+    arima_forecast = forecast_arima(panel, arima_models, horizon=horizon)
+    return panel, features_df, lgbm_forecast, arima_forecast
 
 
 if __name__ == "__main__":
-    results = run_pipeline(db_path='equipment_rental_synthetic.db')
+    results = run_pipeline(db_path="equipment_rental_large.db", n_folds=1)
     print_pipeline_summary(results)
+
+    save_models(results["lgbm_model"], results["arima_models"])

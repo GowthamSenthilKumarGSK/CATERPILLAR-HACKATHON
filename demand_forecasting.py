@@ -254,3 +254,5 @@ st.bar_chart(monthly_pattern, x="Month", y="Rentals", use_container_width=True)
 
 peak_month = monthly_pattern.loc[monthly_pattern["Rentals"].idxmax(), "Month"]
 st.info(f"Peak demand month: **{peak_month}**")
+
+

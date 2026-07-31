@@ -10,10 +10,10 @@ import lightgbm as lgb
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 from db_helpers import get_connection, refresh_equipment_status
 from forecast_LightGBM import (
-    load_joined_rental_data, build_demand_panel, add_features,
-    walk_forward_validate, evaluate_baseline_walk_forward,
-    fit_final_models_and_forecast, FEATURE_COLS,
+    load_joined_rental_data, build_demand_panel,
+    load_or_train_forecast_models,
 )
+from report_page import render_report_page
 
 st.set_page_config(page_title="Equipment Rental Dashboard", layout="wide")
 
@@ -21,7 +21,7 @@ TODAY = date.today()
 
 # --- Sidebar navigation ---
 st.sidebar.title("Navigation")
-page = st.sidebar.radio("Go to", ["Dashboard", "Check In / Out", "Usage Logging", "Alerts & Reminders", "Demand Forecasting", "Anomaly Detection", "Smart Scheduling", "Predictive Maintenance", "Ask Fleet AI"], label_visibility="collapsed")
+page = st.sidebar.radio("Go to", ["Dashboard", "Check In / Out", "Usage Logging", "Alerts & Reminders", "Demand Forecasting", "Anomaly Detection", "Smart Scheduling", "Predictive Maintenance", "Ask Fleet AI","Report Export"], label_visibility="collapsed")
 
 
 # === Shared helpers ===
@@ -719,13 +719,348 @@ elif page == "Alerts & Reminders":
 # =====================================================================
 # PAGE 5: DEMAND FORECASTING
 # =====================================================================
+# elif page == "Demand Forecasting":
+#     st.markdown(
+#         "<h1 style='text-align:center;'>Equipment Demand Forecasting</h1>",
+#         unsafe_allow_html=True,
+#     )
+
+#     SYNTH_DB = "equipment_rental_synthetic.db"
+#     MAIN_DB = "equipment_rental.db"
+
+#     import os
+#     fc_db_path = SYNTH_DB if os.path.exists(SYNTH_DB) else MAIN_DB
+#     conn = sqlite3.connect(fc_db_path)
+
+#     df_fc = pd.read_sql_query("""
+#         SELECT r.equipment_id, e.type, r.site_id, r.operator_id,
+#                r.check_in_date, r.actual_return_date, r.expected_return_date,
+#                r.rental_days, r.is_returned,
+#                r.engine_hours_per_day, r.idle_hours_per_day,
+#                e.daily_rental_rate
+#         FROM rentals r
+#         JOIN equipment e ON r.equipment_id = e.equipment_id
+#         WHERE r.check_in_date IS NOT NULL AND r.check_in_date != '1900-01-01'
+#         ORDER BY r.check_in_date
+#     """, conn)
+
+#     df_fc["check_in_date"] = pd.to_datetime(df_fc["check_in_date"])
+#     df_fc["actual_return_date"] = pd.to_datetime(df_fc["actual_return_date"])
+#     df_fc["expected_return_date"] = pd.to_datetime(df_fc["expected_return_date"])
+
+#     if df_fc.empty:
+#         st.warning("No rental data available for forecasting.")
+#     else:
+#         # Filters
+#         fc1, fc2, fc3 = st.columns(3)
+#         with fc1:
+#             eq_types = ["All"] + sorted(df_fc["type"].dropna().unique().tolist())
+#             sel_fc_type = st.selectbox("Equipment Type", eq_types, key="fc_type")
+#         with fc2:
+#             fc_sites = ["All"] + sorted(df_fc["site_id"].dropna().unique().tolist())
+#             sel_fc_site = st.selectbox("Site", fc_sites, key="fc_site")
+#         with fc3:
+#             forecast_weeks = st.slider("Forecast Horizon (weeks)", 1, 12, 8)
+
+#         fc_filtered = df_fc.copy()
+#         if sel_fc_type != "All":
+#             fc_filtered = fc_filtered[fc_filtered["type"] == sel_fc_type]
+#         if sel_fc_site != "All":
+#             fc_filtered = fc_filtered[fc_filtered["site_id"] == sel_fc_site]
+
+#         if fc_filtered.empty:
+#             st.warning("No data matches the selected filters.")
+#         else:
+#             # --- SECTION 1: Historical demand ---
+#             st.subheader("Historical Rental Demand")
+#             daily_demand = (
+#                 fc_filtered.set_index("check_in_date")
+#                 .resample("W")["equipment_id"]
+#                 .count()
+#                 .rename("rentals")
+#                 .reset_index()
+#             )
+#             daily_demand.columns = ["Week", "Rentals"]
+#             st.line_chart(daily_demand, x="Week", y="Rentals", use_container_width=True)
+
+#             # --- SECTION 2: Demand by type ---
+#             st.subheader("Demand by Equipment Type")
+#             type_demand = fc_filtered.groupby("type").agg(
+#                 total_rentals=("equipment_id", "count"),
+#                 avg_rental_days=("rental_days", "mean"),
+#                 total_revenue=("daily_rental_rate", lambda x: (x * fc_filtered.loc[x.index, "rental_days"]).sum()),
+#             ).reset_index()
+#             type_demand.columns = ["Type", "Total Rentals", "Avg Rental Days", "Est. Revenue ($)"]
+#             type_demand["Avg Rental Days"] = type_demand["Avg Rental Days"].round(1)
+#             type_demand["Est. Revenue ($)"] = type_demand["Est. Revenue ($)"].round(0).astype(int)
+#             st.dataframe(type_demand, use_container_width=True, hide_index=True)
+
+#             # --- SECTION 3: Demand by site ---
+#             st.subheader("Demand by Site")
+#             site_demand = fc_filtered.groupby("site_id").agg(
+#                 total_rentals=("equipment_id", "count"),
+#                 avg_rental_days=("rental_days", "mean"),
+#                 unique_equipment=("equipment_id", "nunique"),
+#             ).reset_index()
+#             site_demand.columns = ["Site", "Total Rentals", "Avg Rental Days", "Unique Equipment Used"]
+#             site_demand["Avg Rental Days"] = site_demand["Avg Rental Days"].round(1)
+#             site_demand = site_demand.sort_values("Total Rentals", ascending=False)
+#             st.dataframe(site_demand, use_container_width=True, hide_index=True)
+
+#             # =============================================================
+#             # SECTION 4: LightGBM ML FORECAST
+#             # =============================================================
+#             st.markdown("---")
+#             st.subheader("LightGBM Demand Forecast")
+#             st.caption("Global gradient-boosted model trained across all (site, type) series with walk-forward validation")
+
+#             @st.cache_data(ttl=300, show_spinner="Training LightGBM model...")
+#             def run_lgbm_forecast(_db_path, horizon):
+#                 rentals = load_joined_rental_data(_db_path)
+#                 panel = build_demand_panel(rentals, freq="W-MON")
+#                 features_df = add_features(panel)
+#                 available_feats = [c for c in FEATURE_COLS if c in features_df.columns]
+
+#                 n_periods = features_df["period"].nunique()
+#                 min_train = max(8, n_periods // 3)
+
+#                 wf_result = walk_forward_validate(
+#                     features_df, available_feats,
+#                     n_folds=4, min_train_periods=min_train, horizon=1,
+#                 )
+#                 baseline_df = evaluate_baseline_walk_forward(panel, n_folds=4, horizon=1)
+#                 final = fit_final_models_and_forecast(
+#                     features_df, available_feats, horizon=horizon, freq="W-MON",
+#                 )
+#                 return wf_result, baseline_df, final, features_df
+
+#             try:
+#                 wf_result, baseline_df, final_fc, features_df = run_lgbm_forecast(fc_db_path, forecast_weeks)
+
+#                 # --- Model performance cards ---
+#                 baseline_mae = baseline_df["mae"].mean()
+#                 lgbm_mae = wf_result.mean_mae
+#                 improvement = (baseline_mae - lgbm_mae) / baseline_mae * 100 if baseline_mae > 0 else 0
+
+#                 pm1, pm2, pm3, pm4 = st.columns(4)
+#                 for col, lbl, val, clr in [
+#                     (pm1, "LightGBM MAE", f"{lgbm_mae:.3f}", "#3b82f6"),
+#                     (pm2, "LightGBM RMSE", f"{wf_result.mean_rmse:.3f}", "#f59e0b"),
+#                     (pm3, "Baseline MAE", f"{baseline_mae:.3f}", "#6b7280"),
+#                     (pm4, "Improvement", f"{improvement:.1f}%", "#22c55e" if improvement > 0 else "#ef4444"),
+#                 ]:
+#                     col.markdown(
+#                         f"<div style='background:{clr}20; border-left:4px solid {clr}; padding:12px 16px; border-radius:8px; text-align:center;'>"
+#                         f"<div style='font-size:28px; font-weight:700; color:{clr};'>{val}</div>"
+#                         f"<div style='font-size:13px; color:{clr};'>{lbl}</div></div>",
+#                         unsafe_allow_html=True,
+#                     )
+
+#                 if improvement <= 0:
+#                     st.warning("LightGBM does not beat the seasonal-naive baseline — consider adding more data or features.")
+#                 else:
+#                     st.success(f"LightGBM outperforms seasonal-naive baseline by **{improvement:.1f}%** (walk-forward out-of-sample).")
+
+#                 # --- Walk-forward fold details ---
+#                 st.markdown("---")
+#                 st.subheader("Walk-Forward Validation (Expanding Window)")
+#                 st.caption("Each fold trains on all data up to the cutoff, then predicts the next week — no data leakage.")
+#                 fold_display = wf_result.fold_metrics.copy()
+#                 fold_display.columns = ["Fold", "Train Periods", "Test Period Start", "Test Rows", "MAE", "RMSE"]
+#                 fold_display["MAE"] = fold_display["MAE"].round(4)
+#                 fold_display["RMSE"] = fold_display["RMSE"].round(4)
+#                 st.dataframe(fold_display, use_container_width=True, hide_index=True)
+
+#                 # --- Forecast chart: point + upper ---
+#                 st.markdown("---")
+#                 st.subheader(f"Forecast — Next {forecast_weeks} Weeks (Point + Upper 80th Pct)")
+
+#                 merged_fc = final_fc.point_forecast.merge(
+#                     final_fc.upper_forecast, on=["site_id", "equipment_type", "period"]
+#                 )
+
+#                 fc_display = merged_fc.copy()
+#                 if sel_fc_type != "All":
+#                     fc_display = fc_display[fc_display["equipment_type"] == sel_fc_type]
+#                 if sel_fc_site != "All":
+#                     fc_display = fc_display[fc_display["site_id"] == sel_fc_site]
+
+#                 if fc_display.empty:
+#                     st.info("No forecast data for the selected filters.")
+#                 else:
+#                     weekly_agg = fc_display.groupby("period").agg(
+#                         point=("point_forecast", "sum"),
+#                         upper=("upper_forecast", "sum"),
+#                     ).reset_index()
+#                     weekly_agg.columns = ["Week", "Predicted (Point)", "Upper (80th Pct)"]
+#                     weekly_agg["Predicted (Point)"] = weekly_agg["Predicted (Point)"].round(1)
+#                     weekly_agg["Upper (80th Pct)"] = weekly_agg["Upper (80th Pct)"].round(1)
+
+#                     st.line_chart(weekly_agg.set_index("Week"), use_container_width=True)
+
+#                     st.dataframe(weekly_agg, use_container_width=True, hide_index=True)
+
+#                 # --- Per site x type forecast table ---
+#                 st.markdown("---")
+#                 st.subheader("Forecast by Site & Equipment Type")
+#                 st.caption("Granular (site, type, week) predictions for pre-positioning decisions")
+
+#                 detail_fc = merged_fc.copy()
+#                 if sel_fc_type != "All":
+#                     detail_fc = detail_fc[detail_fc["equipment_type"] == sel_fc_type]
+#                 if sel_fc_site != "All":
+#                     detail_fc = detail_fc[detail_fc["site_id"] == sel_fc_site]
+
+#                 if not detail_fc.empty:
+#                     pivot_point = detail_fc.groupby(["site_id", "equipment_type"]).agg(
+#                         total_point=("point_forecast", "sum"),
+#                         total_upper=("upper_forecast", "sum"),
+#                         avg_weekly=("point_forecast", "mean"),
+#                     ).reset_index()
+#                     pivot_point.columns = ["Site", "Type", "Total Predicted", "Total Upper", "Avg Weekly"]
+#                     pivot_point["Total Predicted"] = pivot_point["Total Predicted"].round(1)
+#                     pivot_point["Total Upper"] = pivot_point["Total Upper"].round(1)
+#                     pivot_point["Avg Weekly"] = pivot_point["Avg Weekly"].round(2)
+#                     pivot_point = pivot_point.sort_values("Total Predicted", ascending=False)
+#                     st.dataframe(pivot_point, use_container_width=True, hide_index=True)
+
+#                 # --- Feature importance ---
+#                 st.markdown("---")
+#                 st.subheader("Feature Importance (LightGBM)")
+#                 imp = final_fc.feature_importance.copy()
+#                 imp.columns = ["Feature", "Importance"]
+#                 st.bar_chart(imp.set_index("Feature"), use_container_width=True)
+
+#             except (ValueError, Exception) as e:
+#                 st.error(f"LightGBM forecasting failed: {e}")
+#                 st.info("Falling back to moving average forecast below.")
+
+#             # =============================================================
+#             # SECTION 5: MOVING AVERAGE FORECAST (fallback / comparison)
+#             # =============================================================
+#             st.markdown("---")
+#             st.subheader("Moving Average Forecast (Baseline Comparison)")
+
+#             completed = fc_filtered[fc_filtered["is_returned"] == 1].copy()
+
+#             if completed.empty:
+#                 st.info("Not enough completed rentals to generate a moving average forecast.")
+#             else:
+#                 monthly_demand = (
+#                     completed.set_index("check_in_date")
+#                     .resample("MS")["equipment_id"]
+#                     .count()
+#                     .rename("rentals")
+#                 )
+
+#                 if len(monthly_demand) < 2:
+#                     st.info("Need at least 2 months of data for moving average.")
+#                 else:
+#                     forecast_days = forecast_weeks * 7
+#                     window = min(3, len(monthly_demand))
+#                     moving_avg = monthly_demand.rolling(window=window).mean().dropna()
+
+#                     last_date = monthly_demand.index.max()
+#                     avg_monthly_rate = moving_avg.iloc[-1]
+#                     avg_daily_rate = avg_monthly_rate / 30
+
+#                     forecast_dates = pd.date_range(last_date + timedelta(days=1), periods=forecast_days, freq="D")
+#                     forecast_weekly = (
+#                         pd.Series(avg_daily_rate, index=forecast_dates)
+#                         .resample("W")
+#                         .sum()
+#                         .reset_index()
+#                     )
+#                     forecast_weekly.columns = ["Week", "Predicted Rentals"]
+#                     forecast_weekly["Predicted Rentals"] = forecast_weekly["Predicted Rentals"].round(1)
+
+#                     mc1, mc2, mc3 = st.columns(3)
+#                     mc1.metric("Avg Monthly Demand", f"{avg_monthly_rate:.1f} rentals")
+#                     mc2.metric(f"Predicted Next {forecast_days} Days", f"{avg_daily_rate * forecast_days:.0f} rentals")
+
+#                     avg_days = completed["rental_days"].mean()
+#                     avg_rate = completed["daily_rental_rate"].mean()
+#                     projected_revenue = avg_daily_rate * forecast_days * avg_days * avg_rate
+#                     mc3.metric("Projected Revenue", f"${projected_revenue:,.0f}")
+
+#                     st.bar_chart(forecast_weekly, x="Week", y="Predicted Rentals", use_container_width=True)
+
+#             # =============================================================
+#             # SECTION 6: FLEET UTILIZATION & AVAILABILITY
+#             # =============================================================
+#             st.markdown("---")
+#             st.subheader("Fleet Utilization & Availability Outlook")
+
+#             equipment_df = pd.read_sql_query("SELECT equipment_id, type, status FROM equipment", conn)
+#             if sel_fc_type != "All":
+#                 equipment_df = equipment_df[equipment_df["type"] == sel_fc_type]
+
+#             total_fleet = len(equipment_df)
+#             available_now = len(equipment_df[equipment_df["status"] == "available"])
+#             rented_now = len(equipment_df[equipment_df["status"].isin(["rented", "overdue"])])
+
+#             active_rentals = fc_filtered[(fc_filtered["is_returned"] == 0) & (fc_filtered["expected_return_date"].notna())].copy()
+#             today_ts = pd.Timestamp(date.today())
+#             returning_7d = len(active_rentals[active_rentals["expected_return_date"] <= today_ts + timedelta(days=7)]) if not active_rentals.empty else 0
+#             returning_30d = len(active_rentals[active_rentals["expected_return_date"] <= today_ts + timedelta(days=30)]) if not active_rentals.empty else 0
+
+#             uc1, uc2, uc3, uc4 = st.columns(4)
+#             for col, lbl, val, clr in [
+#                 (uc1, "Total Fleet", total_fleet, "#3b82f6"),
+#                 (uc2, "Available Now", available_now, "#22c55e"),
+#                 (uc3, "Returning in 7 Days", returning_7d, "#f59e0b"),
+#                 (uc4, "Returning in 30 Days", returning_30d, "#a855f7"),
+#             ]:
+#                 col.markdown(
+#                     f"<div style='background:{clr}20; border-left:4px solid {clr}; padding:12px 16px; border-radius:8px; text-align:center;'>"
+#                     f"<div style='font-size:28px; font-weight:700; color:{clr};'>{val}</div>"
+#                     f"<div style='font-size:13px; color:{clr};'>{lbl}</div></div>",
+#                     unsafe_allow_html=True,
+#                 )
+
+#             # Supply vs demand
+#             utilization_pct = (rented_now / total_fleet * 100) if total_fleet > 0 else 0
+
+#             st.markdown("---")
+#             st.subheader("Supply vs. Demand Summary")
+
+#             sd1, sd2 = st.columns(2)
+#             sd1.metric("Current Utilization", f"{utilization_pct:.0f}%")
+#             sd2.metric("Fleet Size", f"{total_fleet} units")
+
+#             # =============================================================
+#             # SECTION 7: SEASONAL PATTERNS
+#             # =============================================================
+#             st.markdown("---")
+#             st.subheader("Seasonal Demand Patterns")
+
+#             completed_all = fc_filtered[fc_filtered["is_returned"] == 1].copy()
+#             if not completed_all.empty:
+#                 completed_all["month"] = completed_all["check_in_date"].dt.month_name()
+#                 completed_all["month_num"] = completed_all["check_in_date"].dt.month
+
+#                 monthly_pattern = (
+#                     completed_all.groupby(["month_num", "month"])["equipment_id"]
+#                     .count()
+#                     .reset_index()
+#                 )
+#                 monthly_pattern.columns = ["month_num", "Month", "Rentals"]
+#                 monthly_pattern = monthly_pattern.sort_values("month_num")
+
+#                 st.bar_chart(monthly_pattern, x="Month", y="Rentals", use_container_width=True)
+
+#                 peak_month = monthly_pattern.loc[monthly_pattern["Rentals"].idxmax(), "Month"]
+#                 st.info(f"Peak demand month: **{peak_month}**")
+
+#     conn.close()
+
 elif page == "Demand Forecasting":
     st.markdown(
         "<h1 style='text-align:center;'>Equipment Demand Forecasting</h1>",
         unsafe_allow_html=True,
     )
 
-    SYNTH_DB = "equipment_rental_synthetic.db"
+    SYNTH_DB = "equipment_rental_large.db"
     MAIN_DB = "equipment_rental.db"
 
     import os
@@ -771,222 +1106,144 @@ elif page == "Demand Forecasting":
         if fc_filtered.empty:
             st.warning("No data matches the selected filters.")
         else:
-            # --- SECTION 1: Historical demand ---
-            st.subheader("Historical Rental Demand")
-            daily_demand = (
-                fc_filtered.set_index("check_in_date")
-                .resample("W")["equipment_id"]
-                .count()
-                .rename("rentals")
-                .reset_index()
-            )
-            daily_demand.columns = ["Week", "Rentals"]
-            st.line_chart(daily_demand, x="Week", y="Rentals", use_container_width=True)
+            # --- SECTION 1: Historical working-hours demand ---
+            st.subheader("Historical Working-Hours Demand")
+            rentals = load_joined_rental_data(fc_db_path)
+            history_panel = build_demand_panel(rentals, freq="W-MON")
+            history_panel["week"] = pd.to_datetime(history_panel["week"])
 
-            # --- SECTION 2: Demand by type ---
+            if sel_fc_type != "All":
+                history_panel = history_panel[history_panel["equipment_type"] == sel_fc_type]
+            if sel_fc_site != "All":
+                history_panel = history_panel[history_panel["site_id"] == sel_fc_site]
+
+            historical_weekly = (
+                history_panel.groupby("week", as_index=False)["working_hours"].sum()
+                .rename(columns={"working_hours": "Working Hours"})
+            )
+            historical_weekly.columns = ["Week", "Working Hours"]
+            st.line_chart(historical_weekly.set_index("Week"), use_container_width=True)
+
+            # --- SECTION 2: Demand by equipment type ---
             st.subheader("Demand by Equipment Type")
-            type_demand = fc_filtered.groupby("type").agg(
-                total_rentals=("equipment_id", "count"),
-                avg_rental_days=("rental_days", "mean"),
-                total_revenue=("daily_rental_rate", lambda x: (x * fc_filtered.loc[x.index, "rental_days"]).sum()),
-            ).reset_index()
-            type_demand.columns = ["Type", "Total Rentals", "Avg Rental Days", "Est. Revenue ($)"]
-            type_demand["Avg Rental Days"] = type_demand["Avg Rental Days"].round(1)
-            type_demand["Est. Revenue ($)"] = type_demand["Est. Revenue ($)"].round(0).astype(int)
+            type_demand = (
+                history_panel.groupby("equipment_type", as_index=False)
+                .agg(
+                    total_working_hours=("working_hours", "sum"),
+                    avg_weekly_working_hours=("working_hours", "mean"),
+                )
+            )
+            type_demand.columns = ["Type", "Total Working Hours", "Avg Weekly Working Hours"]
+            type_demand["Total Working Hours"] = type_demand["Total Working Hours"].round(1)
+            type_demand["Avg Weekly Working Hours"] = type_demand["Avg Weekly Working Hours"].round(1)
             st.dataframe(type_demand, use_container_width=True, hide_index=True)
 
             # --- SECTION 3: Demand by site ---
             st.subheader("Demand by Site")
-            site_demand = fc_filtered.groupby("site_id").agg(
-                total_rentals=("equipment_id", "count"),
-                avg_rental_days=("rental_days", "mean"),
-                unique_equipment=("equipment_id", "nunique"),
-            ).reset_index()
-            site_demand.columns = ["Site", "Total Rentals", "Avg Rental Days", "Unique Equipment Used"]
-            site_demand["Avg Rental Days"] = site_demand["Avg Rental Days"].round(1)
-            site_demand = site_demand.sort_values("Total Rentals", ascending=False)
+            site_demand = (
+                history_panel.groupby("site_id", as_index=False)
+                .agg(
+                    total_working_hours=("working_hours", "sum"),
+                    avg_weekly_working_hours=("working_hours", "mean"),
+                    unique_equipment=("equipment_type", "nunique"),
+                )
+            )
+            site_demand.columns = ["Site", "Total Working Hours", "Avg Weekly Working Hours", "Unique Equipment Types"]
+            site_demand["Total Working Hours"] = site_demand["Total Working Hours"].round(1)
+            site_demand["Avg Weekly Working Hours"] = site_demand["Avg Weekly Working Hours"].round(1)
+            site_demand = site_demand.sort_values("Total Working Hours", ascending=False)
             st.dataframe(site_demand, use_container_width=True, hide_index=True)
 
             # =============================================================
-            # SECTION 4: LightGBM ML FORECAST
+            # SECTION 4: DEMAND FORECASTS
             # =============================================================
             st.markdown("---")
-            st.subheader("LightGBM Demand Forecast")
-            st.caption("Global gradient-boosted model trained across all (site, type) series with walk-forward validation")
+            st.subheader("Demand Forecasts (LGBM & ARIMA)")
+            st.caption("Weekly working-hours demand forecast from the saved LightGBM and ARIMA models")
 
-            @st.cache_data(ttl=300, show_spinner="Training LightGBM model...")
-            def run_lgbm_forecast(_db_path, horizon):
-                rentals = load_joined_rental_data(_db_path)
-                panel = build_demand_panel(rentals, freq="W-MON")
-                features_df = add_features(panel)
-                available_feats = [c for c in FEATURE_COLS if c in features_df.columns]
-
-                n_periods = features_df["period"].nunique()
-                min_train = max(8, n_periods // 3)
-
-                wf_result = walk_forward_validate(
-                    features_df, available_feats,
-                    n_folds=4, min_train_periods=min_train, horizon=1,
+            @st.cache_data(ttl=300, show_spinner="Loading saved demand models...")
+            def run_demand_forecast(_db_path, horizon):
+                _, _, lgbm_forecast, arima_forecast = load_or_train_forecast_models(
+                    db_path=_db_path, horizon=horizon, out_dir="saved_models"
                 )
-                baseline_df = evaluate_baseline_walk_forward(panel, n_folds=4, horizon=1)
-                final = fit_final_models_and_forecast(
-                    features_df, available_feats, horizon=horizon, freq="W-MON",
-                )
-                return wf_result, baseline_df, final, features_df
+                return lgbm_forecast, arima_forecast
 
             try:
-                wf_result, baseline_df, final_fc, features_df = run_lgbm_forecast(fc_db_path, forecast_weeks)
+                lgbm_forecast, arima_forecast = run_demand_forecast(fc_db_path, forecast_weeks)
 
-                # --- Model performance cards ---
-                baseline_mae = baseline_df["mae"].mean()
-                lgbm_mae = wf_result.mean_mae
-                improvement = (baseline_mae - lgbm_mae) / baseline_mae * 100 if baseline_mae > 0 else 0
+                def prepare_forecast_view(forecast_df):
+                    view = forecast_df.copy()
+                    view["week"] = pd.to_datetime(view["week"])
+                    if sel_fc_type != "All":
+                        view = view[view["equipment_type"] == sel_fc_type]
+                    if sel_fc_site != "All":
+                        view = view[view["site_id"] == sel_fc_site]
+                    return view
 
-                pm1, pm2, pm3, pm4 = st.columns(4)
-                for col, lbl, val, clr in [
-                    (pm1, "LightGBM MAE", f"{lgbm_mae:.3f}", "#3b82f6"),
-                    (pm2, "LightGBM RMSE", f"{wf_result.mean_rmse:.3f}", "#f59e0b"),
-                    (pm3, "Baseline MAE", f"{baseline_mae:.3f}", "#6b7280"),
-                    (pm4, "Improvement", f"{improvement:.1f}%", "#22c55e" if improvement > 0 else "#ef4444"),
-                ]:
-                    col.markdown(
-                        f"<div style='background:{clr}20; border-left:4px solid {clr}; padding:12px 16px; border-radius:8px; text-align:center;'>"
-                        f"<div style='font-size:28px; font-weight:700; color:{clr};'>{val}</div>"
-                        f"<div style='font-size:13px; color:{clr};'>{lbl}</div></div>",
-                        unsafe_allow_html=True,
-                    )
+                lgbm_view = prepare_forecast_view(lgbm_forecast)
+                arima_view = prepare_forecast_view(arima_forecast)
 
-                if improvement <= 0:
-                    st.warning("LightGBM does not beat the seasonal-naive baseline — consider adding more data or features.")
-                else:
-                    st.success(f"LightGBM outperforms seasonal-naive baseline by **{improvement:.1f}%** (walk-forward out-of-sample).")
-
-                # --- Walk-forward fold details ---
-                st.markdown("---")
-                st.subheader("Walk-Forward Validation (Expanding Window)")
-                st.caption("Each fold trains on all data up to the cutoff, then predicts the next week — no data leakage.")
-                fold_display = wf_result.fold_metrics.copy()
-                fold_display.columns = ["Fold", "Train Periods", "Test Period Start", "Test Rows", "MAE", "RMSE"]
-                fold_display["MAE"] = fold_display["MAE"].round(4)
-                fold_display["RMSE"] = fold_display["RMSE"].round(4)
-                st.dataframe(fold_display, use_container_width=True, hide_index=True)
-
-                # --- Forecast chart: point + upper ---
-                st.markdown("---")
-                st.subheader(f"Forecast — Next {forecast_weeks} Weeks (Point + Upper 80th Pct)")
-
-                merged_fc = final_fc.point_forecast.merge(
-                    final_fc.upper_forecast, on=["site_id", "equipment_type", "period"]
-                )
-
-                fc_display = merged_fc.copy()
-                if sel_fc_type != "All":
-                    fc_display = fc_display[fc_display["equipment_type"] == sel_fc_type]
-                if sel_fc_site != "All":
-                    fc_display = fc_display[fc_display["site_id"] == sel_fc_site]
-
-                if fc_display.empty:
+                if lgbm_view.empty and arima_view.empty:
                     st.info("No forecast data for the selected filters.")
                 else:
-                    weekly_agg = fc_display.groupby("period").agg(
-                        point=("point_forecast", "sum"),
-                        upper=("upper_forecast", "sum"),
-                    ).reset_index()
-                    weekly_agg.columns = ["Week", "Predicted (Point)", "Upper (80th Pct)"]
-                    weekly_agg["Predicted (Point)"] = weekly_agg["Predicted (Point)"].round(1)
-                    weekly_agg["Upper (80th Pct)"] = weekly_agg["Upper (80th Pct)"].round(1)
+                    st.markdown("---")
+                    st.subheader("Forecast by Site-Machine Pair")
+                    pair_forecast = (
+                        lgbm_view.rename(columns={"forecast": "forecast_hours"})
+                        .copy()
+                    )
+                    pair_forecast["pair_label"] = (
+                        pair_forecast["site_id"].astype(str) + " - " + pair_forecast["equipment_type"].astype(str)
+                    )
 
-                    st.line_chart(weekly_agg.set_index("Week"), use_container_width=True)
+                    site_names = sorted(pair_forecast["site_id"].astype(str).unique().tolist())
+                    for site_name in site_names:
+                        site_plot = pair_forecast[pair_forecast["site_id"].astype(str) == site_name]
+                        if site_plot.empty:
+                            continue
 
-                    st.dataframe(weekly_agg, use_container_width=True, hide_index=True)
+                        site_plot = (
+                            site_plot.pivot_table(
+                                index="week",
+                                columns="pair_label",
+                                values="forecast_hours",
+                                aggfunc="sum",
+                            )
+                            .fillna(0)
+                        )
+                        if not site_plot.empty:
+                            st.subheader(f"{site_name} Forecast")
+                            st.line_chart(site_plot, use_container_width=True)
 
-                # --- Per site x type forecast table ---
-                st.markdown("---")
-                st.subheader("Forecast by Site & Equipment Type")
-                st.caption("Granular (site, type, week) predictions for pre-positioning decisions")
-
-                detail_fc = merged_fc.copy()
-                if sel_fc_type != "All":
-                    detail_fc = detail_fc[detail_fc["equipment_type"] == sel_fc_type]
-                if sel_fc_site != "All":
-                    detail_fc = detail_fc[detail_fc["site_id"] == sel_fc_site]
-
-                if not detail_fc.empty:
-                    pivot_point = detail_fc.groupby(["site_id", "equipment_type"]).agg(
-                        total_point=("point_forecast", "sum"),
-                        total_upper=("upper_forecast", "sum"),
-                        avg_weekly=("point_forecast", "mean"),
-                    ).reset_index()
-                    pivot_point.columns = ["Site", "Type", "Total Predicted", "Total Upper", "Avg Weekly"]
-                    pivot_point["Total Predicted"] = pivot_point["Total Predicted"].round(1)
-                    pivot_point["Total Upper"] = pivot_point["Total Upper"].round(1)
-                    pivot_point["Avg Weekly"] = pivot_point["Avg Weekly"].round(2)
-                    pivot_point = pivot_point.sort_values("Total Predicted", ascending=False)
-                    st.dataframe(pivot_point, use_container_width=True, hide_index=True)
-
-                # --- Feature importance ---
-                st.markdown("---")
-                st.subheader("Feature Importance (LightGBM)")
-                imp = final_fc.feature_importance.copy()
-                imp.columns = ["Feature", "Importance"]
-                st.bar_chart(imp.set_index("Feature"), use_container_width=True)
+                    detail_fc = (
+                        lgbm_view.rename(columns={"forecast": "lightgbm_forecast"})
+                        .merge(
+                            arima_view.rename(columns={"forecast": "arima_forecast"}),
+                            on=["site_id", "equipment_type", "week"],
+                            how="outer",
+                        )
+                        .fillna(0)
+                    )
+                    detail_fc["week"] = detail_fc["week"].dt.strftime("%Y-%m-%d")
+                    pivot = (
+                        detail_fc.groupby(["site_id", "equipment_type"], as_index=False)
+                        .agg(
+                            lightgbm_total=("lightgbm_forecast", "sum"),
+                            arima_total=("arima_forecast", "sum"),
+                        )
+                    )
+                    pivot.columns = ["Site", "Type", "LightGBM Forecast (hrs)", "ARIMA Forecast (hrs)"]
+                    pivot["LightGBM Forecast (hrs)"] = pivot["LightGBM Forecast (hrs)"].round(1)
+                    pivot["ARIMA Forecast (hrs)"] = pivot["ARIMA Forecast (hrs)"].round(1)
+                    pivot = pivot.sort_values("LightGBM Forecast (hrs)", ascending=False)
+                    st.subheader("Forecast by Site & Equipment Type")
+                    st.dataframe(pivot, use_container_width=True, hide_index=True)
 
             except (ValueError, Exception) as e:
-                st.error(f"LightGBM forecasting failed: {e}")
-                st.info("Falling back to moving average forecast below.")
+                st.error(f"Demand forecasting failed: {e}")
 
             # =============================================================
-            # SECTION 5: MOVING AVERAGE FORECAST (fallback / comparison)
-            # =============================================================
-            st.markdown("---")
-            st.subheader("Moving Average Forecast (Baseline Comparison)")
-
-            completed = fc_filtered[fc_filtered["is_returned"] == 1].copy()
-
-            if completed.empty:
-                st.info("Not enough completed rentals to generate a moving average forecast.")
-            else:
-                monthly_demand = (
-                    completed.set_index("check_in_date")
-                    .resample("MS")["equipment_id"]
-                    .count()
-                    .rename("rentals")
-                )
-
-                if len(monthly_demand) < 2:
-                    st.info("Need at least 2 months of data for moving average.")
-                else:
-                    forecast_days = forecast_weeks * 7
-                    window = min(3, len(monthly_demand))
-                    moving_avg = monthly_demand.rolling(window=window).mean().dropna()
-
-                    last_date = monthly_demand.index.max()
-                    avg_monthly_rate = moving_avg.iloc[-1]
-                    avg_daily_rate = avg_monthly_rate / 30
-
-                    forecast_dates = pd.date_range(last_date + timedelta(days=1), periods=forecast_days, freq="D")
-                    forecast_weekly = (
-                        pd.Series(avg_daily_rate, index=forecast_dates)
-                        .resample("W")
-                        .sum()
-                        .reset_index()
-                    )
-                    forecast_weekly.columns = ["Week", "Predicted Rentals"]
-                    forecast_weekly["Predicted Rentals"] = forecast_weekly["Predicted Rentals"].round(1)
-
-                    mc1, mc2, mc3 = st.columns(3)
-                    mc1.metric("Avg Monthly Demand", f"{avg_monthly_rate:.1f} rentals")
-                    mc2.metric(f"Predicted Next {forecast_days} Days", f"{avg_daily_rate * forecast_days:.0f} rentals")
-
-                    avg_days = completed["rental_days"].mean()
-                    avg_rate = completed["daily_rental_rate"].mean()
-                    projected_revenue = avg_daily_rate * forecast_days * avg_days * avg_rate
-                    mc3.metric("Projected Revenue", f"${projected_revenue:,.0f}")
-
-                    st.bar_chart(forecast_weekly, x="Week", y="Predicted Rentals", use_container_width=True)
-
-            # =============================================================
-            # SECTION 6: FLEET UTILIZATION & AVAILABILITY
+            # SECTION 5: FLEET UTILIZATION & AVAILABILITY
             # =============================================================
             st.markdown("---")
             st.subheader("Fleet Utilization & Availability Outlook")
@@ -2381,3 +2638,7 @@ elif page == "Ask Fleet AI":
         st.markdown(f"**Question:** *{active_query}*")
         st.markdown("")
         process_query(active_query)
+
+
+elif page == "Report Export":
+    render_report_page(TODAY)
